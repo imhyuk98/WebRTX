@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebRTX 1920x1080 Minimal Render</title>
+    <style>
+      html, body { margin: 0; padding: 0; background: #111; }
+      canvas { display: block; margin: 0 auto; background: #000; image-rendering: pixelated; }
+    </style>
+  </head>
+  <body>
+    <!-- Interactive canvas: data-autointeractive triggers auto start (added in index.ts) -->
+    <canvas id="gfx" width="1920" height="1080" data-autointeractive></canvas>
+
+    <!-- Load bundle; auto interactive start handled in src/index.ts when data-autointeractive present -->
+    <script src="./dist/index.js"></script>
+  </body>
+</html>

@@ -1,0 +1,836 @@
+#ifndef _WEBRTX_INTERSECT_
+#define _WEBRTX_INTERSECT_
+
+#include "common.glsl"
+
+// https://tavianator.com/2011/ray_box.html
+// https://medium.com/@bromanz/another-view-on-the-classic-ray-aabb-intersection-algorithm-for-bvh-traversal-41125138b525
+bool intersect_aabb(const vec3 rayOrigin, const vec3 invRayDir,
+                    const float ray_tmin, const float ray_tmax,
+                    const AABB aabb) {
+  vec3 t0 = (aabb.min - rayOrigin) * invRayDir;
+  vec3 t1 = (aabb.max - rayOrigin) * invRayDir;
+  vec3 tmin = min(t0, t1);
+  vec3 tmax = max(t0, t1);
+  return max(ray_tmin, max(max(tmin.x, tmin.y), tmin.z)) <=
+         min(ray_tmax, min(min(tmax.x, tmax.y), tmax.z));
+}
+
+/*
+ * Copyright (c) 1993 - 2010 NVIDIA Corporation.  All rights reserved.
+ *
+ * NOTICE TO USER:
+ *
+ * This source code is subject to NVIDIA ownership rights under U.S. and
+ * international Copyright laws.  Users and possessors of this source code
+ * are hereby granted a nonexclusive, royalty-free license to use this code
+ * in individual and commercial software.
+ *
+ * NVIDIA MAKES NO REPRESENTATION ABOUT THE SUITABILITY OF THIS SOURCE
+ * CODE FOR ANY PURPOSE.  IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR
+ * IMPLIED WARRANTY OF ANY KIND.  NVIDIA DISCLAIMS ALL WARRANTIES WITH
+ * REGARD TO THIS SOURCE CODE, INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY, NONINFRINGEMENT, AND FITNESS FOR A PARTICULAR PURPOSE.
+ * IN NO EVENT SHALL NVIDIA BE LIABLE FOR ANY SPECIAL, INDIRECT, INCIDENTAL,
+ * OR CONSEQUENTIAL DAMAGES, OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
+ * OF USE, DATA OR PROFITS,  WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE
+ * OR OTHER TORTIOUS ACTION,  ARISING OUT OF OR IN CONNECTION WITH THE USE
+ * OR PERFORMANCE OF THIS SOURCE CODE.
+ *
+ * U.S. Government End Users.   This source code is a "commercial item" as
+ * that term is defined at  48 C.F.R. 2.101 (OCT 1995), consisting  of
+ * "commercial computer  software"  and "commercial computer software
+ * documentation" as such terms are  used in 48 C.F.R. 12.212 (SEPT 1995)
+ * and is provided to the U.S. Government only as a commercial end item.
+ * Consistent with 48 C.F.R.12.212 and 48 C.F.R. 227.7202-1 through
+ * 227.7202-4 (JUNE 1995), all U.S. Government End Users acquire the
+ * source code with only those rights set forth herein.
+ *
+ * Any use of this source code in individual and commercial software must
+ * include, in the user documentation and internal comments to the code,
+ * the above Disclaimer and U.S. Government End Users Notice.
+ */
+bool intersect_triangle_branchless(const vec3 ray_origin, const float ray_tmin,
+                                   const vec3 ray_dir, const float ray_tmax,
+                                   const vec3 p0, const vec3 p1, const vec3 p2,
+                                   out vec3 n, out float t, out float beta,
+                                   out float gamma) {
+  const vec3 e0 = p1 - p0;
+  const vec3 e1 = p0 - p2;
+  n = cross(e1, e0);
+
+  const vec3 e2 = (1.f / dot(n, ray_dir)) * (p0 - ray_origin);
+  const vec3 i = cross(ray_dir, e2);
+
+  beta = dot(i, e1);
+  gamma = dot(i, e0);
+  t = dot(n, e2);
+
+  return ((t < ray_tmax) && (t > ray_tmin) && (beta >= 0.f) && (gamma >= 0.f) &&
+          (beta + gamma <= 1));
+}
+
+bool intersect_triangle_earlyexit(Ray ray, vec3 p0, vec3 p1, vec3 p2,
+                                  out vec3 n, out float t, out float beta,
+                                  out float gamma) {
+  vec3 e0 = p1 - p0;
+  vec3 e1 = p0 - p2;
+  n = cross(e0, e1);
+
+  float v = dot(n, ray.direction);
+  float r = 1.f / v;
+
+  vec3 e2 = p0 - ray.origin;
+  float va = dot(n, e2);
+  t = r * va;
+
+  // Initialize these to reduce their liveness when we leave the function
+  // without computing their value.
+  beta = 0;
+  gamma = 0;
+
+  if (t < ray.tmax && t > ray.tmin) {
+    vec3 i = cross(e2, ray.direction);
+    float v1 = dot(i, e1);
+    beta = r * v1;
+    if (beta >= 0.f) {
+      float v2 = dot(i, e0);
+      gamma = r * v2;
+      n = -n;
+      return ((v1 + v2) * v <= v * v && gamma >= 0.f);
+    }
+  }
+  return false;
+}
+
+// Analytic sphere intersection helper for engine primitives.
+// Returns true if a valid hit within [ray_tmin, ray_tmax) is found.
+// Outputs t and geometric normal (unnormalized safe form before normalize if needed).
+bool intersect_sphere(const vec3 rayOrigin, const float ray_tmin,
+                      const vec3 rayDir, const float ray_tmax,
+                      const vec3 center, const float radius,
+                      out float t, out vec3 normal) {
+  vec3 oc = rayOrigin - center;
+  // Ray-sphere: |oc + t*dir|^2 = r^2 → t^2 + 2*(oc·dir)t + (|oc|^2 - r^2)=0
+  float b = dot(oc, rayDir);          // (1/2) * 2b form simplified (a=1)
+  float c = dot(oc, oc) - radius*radius;
+  float disc = b*b - c;
+  if (disc < 0.0) { return false; }
+  float s = sqrt(disc);
+  float t0 = -b - s; // near
+  float t1 = -b + s; // far
+  // pick nearest valid
+  t = t0;
+  if (t < ray_tmin || t >= ray_tmax) {
+    t = t1;
+    if (t < ray_tmin || t >= ray_tmax) return false;
+  }
+  vec3 hitPos = rayOrigin + rayDir * t;
+  normal = hitPos - center; // caller can normalize
+  return true;
+}
+
+// Intersect a finite rectangle plane defined by center, orthonormal xdir, ydir, and half-extents (hx, hy).
+// Returns true if hit; outputs t and geometric normal (oriented by cross(xdir, ydir)).
+bool intersect_plane_rect(const vec3 rayOrigin, const float ray_tmin,
+                          const vec3 rayDir, const float ray_tmax,
+                          const vec3 center, const vec3 xdir, const vec3 ydir,
+                          const float hx, const float hy,
+                          out float t, out vec3 normal) {
+  normal = normalize(cross(xdir, ydir));
+  float denom = dot(normal, rayDir);
+  if (abs(denom) < 5e-6) { return false; }
+  float d = dot(normal, (center - rayOrigin)) / denom;
+  if (d < ray_tmin || d >= ray_tmax) { return false; }
+  // Project hit point into local plane basis
+  vec3 hitPos = rayOrigin + rayDir * d;
+  vec3 rel = hitPos - center;
+  float lx = dot(rel, xdir);
+  float ly = dot(rel, ydir);
+  if (abs(lx) > hx || abs(ly) > hy) { return false; }
+  t = d;
+  return true;
+}
+
+// ============================================================================
+// Circle (disk) intersection: plane defined by center, xdir, ydir (orthonormal span), radius.
+// Returns true if ray hits the disk within [ray_tmin, ray_tmax). Outputs t and normal.
+bool intersect_circle(const vec3 rayOrigin, const float ray_tmin,
+                      const vec3 rayDir, const float ray_tmax,
+                      const vec3 center, const vec3 xdirIn, const vec3 ydirIn,
+                      const float radius,
+                      out float t, out vec3 normal) {
+  // Orthonormalize lightweight (mirror of cylinder approach)
+  vec3 xdir = normalize(xdirIn);
+  vec3 ydir = normalize(ydirIn - xdir * dot(xdirIn, xdir));
+  normal = normalize(cross(xdir, ydir));
+  float denom = dot(rayDir, normal);
+  if (abs(denom) < 5e-6) { return false; }
+  float tt = dot(center - rayOrigin, normal) / denom;
+  if (tt < ray_tmin || tt >= ray_tmax) { return false; }
+  vec3 hitPos = rayOrigin + rayDir * tt;
+  vec3 rel = hitPos - center;
+  // Project onto local basis to test radius (avoids precision issues vs length(rel - normal*dot(rel,normal)))
+  float px = dot(rel, xdir);
+  float py = dot(rel, ydir);
+  if (px*px + py*py > radius * radius) { return false; }
+  t = tt;
+  // normal already set; we could flip to make it oppose ray if desired:
+  if (dot(normal, rayDir) > 0.0) normal = -normal; // ensure it faces incoming ray
+  return true;
+}
+
+// Float-return convenience wrapper (returns t or -1.0). Normal optional.
+float intersect_circle(const vec3 rayOrigin, const float ray_tmin,
+                       const vec3 rayDir, const float ray_tmax,
+                       const vec3 center, const vec3 xdirIn, const vec3 ydirIn,
+                       const float radius,
+                       out vec3 normal) {
+  float t; vec3 n;
+  bool hit = intersect_circle(rayOrigin, ray_tmin, rayDir, ray_tmax,
+                              center, xdirIn, ydirIn, radius, t, n);
+  normal = n;
+  return hit ? t : -1.0;
+}
+
+// ============================================================================
+// Ellipse intersection: plane defined by center, xdir, ydir (orthonormal span), radii rx (along xdir) and ry (along ydir).
+// Returns true if ray hits the ellipse within [ray_tmin, ray_tmax). Outputs t and plane normal (facing incoming ray).
+bool intersect_ellipse(const vec3 rayOrigin, const float ray_tmin,
+                       const vec3 rayDir, const float ray_tmax,
+                       const vec3 center, const vec3 xdirIn, const vec3 ydirIn,
+                       const float radiusX, const float radiusY,
+                       out float t, out vec3 normal) {
+  // Orthonormalize lightweight
+  vec3 xdir = normalize(xdirIn);
+  vec3 ydir = normalize(ydirIn - xdir * dot(xdirIn, xdir));
+  normal = normalize(cross(xdir, ydir));
+  float denom = dot(rayDir, normal);
+  if (abs(denom) < 1e-6) { return false; }
+  float tt = dot(center - rayOrigin, normal) / denom;
+  if (tt < ray_tmin || tt >= ray_tmax) { return false; }
+  vec3 hitPos = rayOrigin + rayDir * tt;
+  vec3 rel = hitPos - center;
+  float px = dot(rel, xdir);
+  float py = dot(rel, ydir);
+  // Dynamic tolerance grows slowly with |tt| to counter precision loss at far distances.
+  float tol = 1e-4 + 1e-6 * abs(tt);
+  float rx = radiusX + tol;
+  float ry = radiusY + tol;
+  float v = (px*px)/(rx*rx) + (py*py)/(ry*ry);
+  if (v > 1.0 + 2.0*tol) { return false; }
+  t = tt;
+  if (dot(normal, rayDir) > 0.0) normal = -normal; // face incoming ray
+  return true;
+}
+
+// Float-return convenience wrapper
+float intersect_ellipse(const vec3 rayOrigin, const float ray_tmin,
+                        const vec3 rayDir, const float ray_tmax,
+                        const vec3 center, const vec3 xdirIn, const vec3 ydirIn,
+                        const float radiusX, const float radiusY,
+                        out vec3 normal) {
+  float t; vec3 n;
+  bool hit = intersect_ellipse(rayOrigin, ray_tmin, rayDir, ray_tmax,
+                               center, xdirIn, ydirIn, radiusX, radiusY, t, n);
+  normal = n;
+  return hit ? t : -1.0;
+}
+// ============================================================================
+
+// Finite cylinder (possibly partial by angle). Axis defined by zdir = normalize(cross(xdir, ydir)) or provided via (xdir, ydir) which span base.
+// Parameters:
+//   center : cylinder center (midpoint between caps)
+//   xdir, ydir : orthonormal (or nearly) spanning vectors for the base plane (their cross defines axis)
+//   radius : cylinder radius
+//   height : full height (so half-height = height * 0.5)
+//   angleDeg : sweep angle in degrees (360 => full, <360 => wedge keeping angles in [0, angleDeg])
+// The wedge truncation is evaluated in the local polar angle around axis using (xdir, ydir) as 0° / 90° references.
+// Returns true if hit; outputs t and unnormalized geometric normal (caller may normalize).
+bool intersect_cylinder(const vec3 rayOrigin, const float ray_tmin,
+                        const vec3 rayDir, const float ray_tmax,
+                        const vec3 center, const vec3 xdirIn, const vec3 ydirIn,
+                        const float radius, const float height, const float angleDeg,
+                        out float t, out vec3 normal) {
+  // Orthonormalize basis (lightweight): assume xdirIn, ydirIn nearly orthonormal.
+  vec3 xdir = normalize(xdirIn);
+  vec3 ydir = normalize(ydirIn - xdir * dot(xdirIn, xdir));
+  vec3 axis = normalize(cross(xdir, ydir)); // axis direction (+z in local frame)
+  float halfH = height * 0.5;
+
+  // Transform ray to cylinder local frame: origin at center, axis=z, xdir->X, ydir->Y.
+  vec3 roW = rayOrigin - center;
+  float roZ = dot(roW, axis);
+  float rdZ = dot(rayDir, axis);
+  vec3 roXY = roW - axis * roZ; // radial component
+  vec3 rdXY = rayDir - axis * rdZ;
+  float a = dot(rdXY, rdXY);
+  float b = 2.0 * dot(roXY, rdXY);
+  float c = dot(roXY, roXY) - radius * radius;
+
+  float bestT = 1e38;
+  int hitType = -1; // 0 side, 1 top, 2 bottom
+  vec3 hitPosLocal = vec3(0.0);
+
+  // Side intersection (quadratic)
+  if (a > 0.0) {
+    float disc = b*b - 4.0*a*c;
+    if (disc >= 0.0) {
+      float sdisc = sqrt(disc);
+      float inv2a = 0.5 / a;
+      float tCand[2];
+      tCand[0] = (-b - sdisc) * inv2a;
+      tCand[1] = (-b + sdisc) * inv2a;
+      for (int i=0;i<2;i++) {
+        float tt = tCand[i];
+        if (tt < ray_tmin || tt >= ray_tmax) continue;
+        float z = roZ + tt * rdZ; // position along axis
+        if (abs(z) > halfH) continue; // outside caps
+        // Wedge angle test if partial
+        vec3 pLocal = roXY + rdXY * tt; // in plane perpendicular to axis
+        // Compute angle between (xdir, ydir) basis
+        float ang = degrees(atan(pLocal.y, pLocal.x)); // range -180..180
+        if (ang < 0.0) ang += 360.0;
+        if (angleDeg < 360.0 && ang > angleDeg) continue;
+        if (tt < bestT) { bestT = tt; hitType = 0; hitPosLocal = vec3(pLocal.x, pLocal.y, z); }
+      }
+    }
+  }
+
+  // Caps intersection (t where along axis plane)
+  if (abs(rdZ) > 1e-6) {
+    // Top cap (z = +halfH)
+    float tTop = (halfH - roZ) / rdZ;
+    if (tTop >= ray_tmin && tTop < ray_tmax) {
+      vec3 pLocal = roXY + rdXY * tTop; // radial at that t
+      if (dot(pLocal, pLocal) <= radius*radius) {
+        // Angle clip
+        float ang = degrees(atan(pLocal.y, pLocal.x)); if (ang < 0.0) ang += 360.0;
+        if (!(angleDeg < 360.0 && ang > angleDeg)) {
+          if (tTop < bestT) { bestT = tTop; hitType = 1; hitPosLocal = vec3(pLocal.x, pLocal.y, halfH); }
+        }
+      }
+    }
+    // Bottom cap (z = -halfH)
+    float tBot = (-halfH - roZ) / rdZ;
+    if (tBot >= ray_tmin && tBot < ray_tmax) {
+      vec3 pLocal = roXY + rdXY * tBot;
+      if (dot(pLocal, pLocal) <= radius*radius) {
+        float ang = degrees(atan(pLocal.y, pLocal.x)); if (ang < 0.0) ang += 360.0;
+        if (!(angleDeg < 360.0 && ang > angleDeg)) {
+          if (tBot < bestT) { bestT = tBot; hitType = 2; hitPosLocal = vec3(pLocal.x, pLocal.y, -halfH); }
+        }
+      }
+    }
+  }
+
+  if (hitType == -1) { return false; }
+  t = bestT;
+  // Reconstruct world hit position
+  vec3 hitPosWorld = rayOrigin + rayDir * t;
+  if (hitType == 0) {
+    // Side: proper radial normal = remove axis component then normalize
+    vec3 rel = hitPosWorld - center;
+    vec3 radial = rel - axis * dot(rel, axis);
+    normal = radial; // caller will normalize
+  } else if (hitType == 1) {
+    normal = axis; // top cap
+  } else { // bottom cap
+    normal = -axis;
+  }
+  return true;
+}
+
+// Wrapper aliases for legacy/alternate naming expecting a "sector" (partial angle) cylinder.
+// Variant returning bool with out t & normal.
+bool intersect_cylinder_sector(const vec3 rayOrigin, const float ray_tmin,
+                               const vec3 rayDir, const float ray_tmax,
+                               const vec3 center, const vec3 xdirIn, const vec3 ydirIn,
+                               const float radius, const float height, const float angleDeg,
+                               out float t, out vec3 normal) {
+  return intersect_cylinder(rayOrigin, ray_tmin, rayDir, ray_tmax,
+                            center, xdirIn, ydirIn, radius, height, angleDeg, t, normal);
+}
+
+// Variant returning hit distance (or -1.0) and outputting normal only.
+float intersect_cylinder_sector(const vec3 rayOrigin, const float ray_tmin,
+                                const vec3 rayDir, const float ray_tmax,
+                                const vec3 center, const vec3 xdirIn, const vec3 ydirIn,
+                                const float radius, const float height, const float angleDeg,
+                                out vec3 normal) {
+  float t; vec3 n;
+  bool hit = intersect_cylinder(rayOrigin, ray_tmin, rayDir, ray_tmax,
+                                center, xdirIn, ydirIn, radius, height, angleDeg, t, n);
+  normal = n;
+  return hit ? t : -1.0;
+}
+
+// ============================================================================
+// Canonical open-cone (no base cap) intersection and normal helpers
+// Cone is defined with center at mid-height, axis (unit), height h, base radius r.
+// Apex = center - axis*(h*0.5), base center = center + axis*(h*0.5).
+// Intersection excludes a tiny band near the apex to avoid degenerate tip artifacts.
+// Returns true if hit within [ray_tmin, ray_tmax); outputs t and unnormalized normal (caller may normalize).
+bool intersect_cone_open(const vec3 rayOrigin, const float ray_tmin,
+                         const vec3 rayDir, const float ray_tmax,
+                         const vec3 centerMid, const vec3 axisIn,
+                         const float height, const float radius,
+                         out float t, out vec3 normal) {
+  vec3 axis = normalize(axisIn);
+  float h = height;
+  float r = radius;
+  vec3 apex = centerMid - axis * (0.5 * h);
+  // Quadratic using cosAlpha form
+  vec3 d = rayDir; vec3 v = axis; vec3 oc = rayOrigin - apex;
+  float hyp = length(vec2(h, r));
+  float cos_a = (hyp > 1e-8) ? (h / hyp) : 0.9999;
+  float cos_a_sq = cos_a * cos_a;
+  float dv = dot(d, v);
+  float ocv = dot(oc, v);
+  float qa = dv*dv - cos_a_sq;
+  float qb = 2.0 * (dv*ocv - cos_a_sq * dot(d, oc));
+  float qc = ocv*ocv - cos_a_sq * dot(oc, oc);
+  float disc = qb*qb - 4.0*qa*qc;
+  if (disc < 0.0) return false;
+  float bestT = 1e38;
+  float sdisc = sqrt(disc);
+  float denom = 2.0 * qa;
+  if (abs(denom) < 1e-12) return false;
+  float zEps = max(1e-3*h, 5e-5); // apex exclusion band
+  // Two candidates
+  float cand[2]; cand[0] = (-qb - sdisc) / denom; cand[1] = (-qb + sdisc) / denom;
+  for (int i=0;i<2;i++) {
+    float tt = cand[i];
+    if (tt < ray_tmin || tt >= ray_tmax || tt >= bestT) continue;
+    vec3 hp = rayOrigin + d * tt;
+    float hit_h = dot(hp - apex, v);
+    if (hit_h <= zEps || hit_h >= h - 1e-6) continue; // open at base and apex band
+    bestT = tt;
+  }
+  if (bestT >= 1e37) return false;
+  t = bestT;
+  // Geometric side normal (unnormalized): combine radial direction and axis using cone slope
+  vec3 hp = rayOrigin + d * t;
+  float proj = dot(hp - apex, v);
+  vec3 radial = (hp - apex) - v * proj;
+  float rlen = max(length(radial), 1e-8);
+  vec3 rdir = radial / rlen;
+  float sin_a = (hyp > 1e-8) ? (r / hyp) : 0.012;
+  normal = rdir * cos_a + v * sin_a; // caller may normalize
+  return true;
+}
+
+// Float-return convenience wrapper.
+float intersect_cone_open(const vec3 rayOrigin, const float ray_tmin,
+                          const vec3 rayDir, const float ray_tmax,
+                          const vec3 centerMid, const vec3 axisIn,
+                          const float height, const float radius,
+                          out vec3 normal) {
+  float t; vec3 n;
+  bool hit = intersect_cone_open(rayOrigin, ray_tmin, rayDir, ray_tmax,
+                                 centerMid, axisIn, height, radius, t, n);
+  normal = n;
+  return hit ? t : -1.0;
+}
+
+// ============================================================================
+// Line segment intersection (rendered as a thin finite cylinder "capsule" without hemispherical caps)
+// Parameters: endpoints p0, p1, and a small radius (thickness). Internally uses intersect_cylinder.
+// Returns true if hit; outputs t and geometric normal.
+void _basis_from_axis(in vec3 axis, out vec3 xdir, out vec3 ydir){
+  vec3 a = normalize(axis);
+  vec3 tmp = (abs(a.z) < 0.999) ? vec3(0.0,0.0,1.0) : vec3(0.0,1.0,0.0);
+  xdir = normalize(cross(tmp, a));
+  ydir = normalize(cross(a, xdir));
+}
+
+bool intersect_line_segment(const vec3 rayOrigin, const float ray_tmin,
+                            const vec3 rayDir, const float ray_tmax,
+                            const vec3 p0, const vec3 p1, const float radius,
+                            out float t, out vec3 normal){
+  vec3 seg = p1 - p0; float h = length(seg);
+  if(h < 1e-7){
+    // Degenerate: treat as a small sphere at midpoint
+    vec3 c = 0.5*(p0 + p1); float R = max(radius, 1e-6);
+    return intersect_sphere(rayOrigin, ray_tmin, rayDir, ray_tmax, c, R, t, normal);
+  }
+  vec3 axis = seg / h;
+  vec3 xdir, ydir; _basis_from_axis(axis, xdir, ydir);
+  vec3 center = 0.5*(p0 + p1);
+  return intersect_cylinder(rayOrigin, ray_tmin, rayDir, ray_tmax,
+                            center, xdir, ydir, radius, h, 360.0, t, normal);
+}
+
+float intersect_line_segment(const vec3 rayOrigin, const float ray_tmin,
+                             const vec3 rayDir, const float ray_tmax,
+                             const vec3 p0, const vec3 p1, const float radius,
+                             out vec3 normal){
+  float t; vec3 n; bool hit = intersect_line_segment(rayOrigin, ray_tmin, rayDir, ray_tmax, p0, p1, radius, t, n);
+  normal = n; return hit ? t : -1.0;
+}
+// ============================================================================
+
+// Aliases to be robust against transpiler/library symbol prefixing
+// These simply forward to the canonical names above.
+bool rtx_intersect_line_segment(const vec3 rayOrigin, const float ray_tmin,
+                            const vec3 rayDir, const float ray_tmax,
+                            const vec3 p0, const vec3 p1, const float radius,
+                            out float t, out vec3 normal){
+  return intersect_line_segment(rayOrigin, ray_tmin, rayDir, ray_tmax, p0, p1, radius, t, normal);
+}
+
+float rtx_intersect_line_segment(const vec3 rayOrigin, const float ray_tmin,
+                             const vec3 rayDir, const float ray_tmax,
+                             const vec3 p0, const vec3 p1, const float radius,
+                             out vec3 normal){
+  return intersect_line_segment(rayOrigin, ray_tmin, rayDir, ray_tmax, p0, p1, radius, normal);
+}
+
+// Close the include guard after all helpers are defined
+#endif // _WEBRTX_INTERSECT_
+
+// =============================================================================
+// Torus intersection (analytic) using Ferrari's quartic method.
+// Oriented torus defined by center, plane basis (xdir, ydir), major radius R and minor radius r.
+
+// Robust wedge test in x–z plane without atan2 to avoid angle discontinuities near p.x≈0.
+// Accepts vectors with polar angle θ relative to +X satisfying 0 <= θ <= angleDeg.
+bool _torus_wedge_inside(vec2 xz, float angleDeg){
+  if (angleDeg >= 360.0) return true;
+  float len = length(xz);
+  if (len < 1e-10) return true; // near axis: accept to avoid holes
+  vec2 u = xz / len; // normalize to make tolerance angular, not metric
+  float a = radians(clamp(angleDeg, 0.0, 360.0));
+  float ca = cos(a);
+  float tol = 3e-4; // angular tolerance
+  // For 0..angle from +X CCW: use z half-plane with 180 split, and dot with +X vs cos(angle)
+  if (angleDeg <= 180.0){
+    return (u.y >= -tol) && (u.x >= ca - tol);
+  } else {
+    return (u.y >= -tol) || (u.x >= ca - tol);
+  }
+}
+
+bool _torus_is_zero(float x){ return abs(x) < 1e-7; }
+float _torus_cbrt(float x){ return sign(x) * pow(abs(x), 1.0/3.0); }
+
+int _torus_solve_quadratic(float c0, float c1, float c2, out float r0, out float r1){
+  if (_torus_is_zero(c2)) { if (_torus_is_zero(c1)) return 0; r0 = -c0 / c1; r1 = r0; return 1; }
+  float disc = c1*c1 - 4.0*c2*c0; if (disc < 0.0) return 0; float s = sqrt(max(disc,0.0)); float inv2a = 0.5 / c2; r0 = (-c1 - s)*inv2a; r1 = (-c1 + s)*inv2a; return (disc>0.0)?2:1;
+}
+
+// Solve x^3 + a x^2 + b x + c = 0; returns number of real roots
+int _torus_solve_cubic(float a, float b, float c, out float r0, out float r1, out float r2){
+  float a2 = a*a;
+  float p = b - a2*(1.0/3.0);
+  float q = 2.0*a*a2*(1.0/27.0) - (a*b)*(1.0/3.0) + c;
+  float p3 = p*(1.0/3.0);
+  float q2 = 0.5*q;
+  float D = q2*q2 + p3*p3*p3;
+  if (D < 0.0){
+    float phi = acos(clamp(-q2 / sqrt(-(p3*p3*p3)), -1.0, 1.0));
+    float t = 2.0*sqrt(-p3);
+    r0 = -a*(1.0/3.0) + t*cos(phi*(1.0/3.0));
+    r1 = -a*(1.0/3.0) + t*cos((phi + 2.0*3.14159265359)*(1.0/3.0));
+    r2 = -a*(1.0/3.0) + t*cos((phi + 4.0*3.14159265359)*(1.0/3.0));
+    return 3;
+  } else {
+    float sqrtD = sqrt(max(D, 0.0));
+    float u = _torus_cbrt(-q2 + sqrtD);
+    float v = _torus_cbrt(-q2 - sqrtD);
+    r0 = -a*(1.0/3.0) + (u + v);
+    return 1;
+  }
+}
+
+// Solve monic quartic x^4 + A x^3 + B x^2 + C x + D = 0 using Ferrari
+int _torus_solve_quartic_monic(float A, float B, float C, float D, out float r0, out float r1, out float r2, out float r3){
+  float sqA = A*A;
+  float p = -3.0*sqA*(1.0/8.0) + B;
+  float q =  A*sqA*(1.0/8.0) - 0.5*A*B + C;
+  float r = -3.0*sqA*sqA*(1.0/256.0) + sqA*B*(1.0/16.0) - 0.25*A*C + D;
+  float sub = 0.25*A;
+  if (_torus_is_zero(r)){
+    // y(y^3 + p y + q) = 0
+    float cr0, cr1, cr2; int cn = _torus_solve_cubic(0.0, p, q, cr0, cr1, cr2);
+    int count = 0; float tmp[4];
+    if (cn>=1) tmp[count++] = cr0; if (cn>=2) tmp[count++] = cr1; if (cn>=3) tmp[count++] = cr2; tmp[count++] = 0.0;
+    if (count>0) r0 = tmp[0] - sub; if (count>1) r1 = tmp[1] - sub; if (count>2) r2 = tmp[2] - sub; if (count>3) r3 = tmp[3] - sub; return count;
+  }
+  // Resolvent cubic: z^3 - 0.5 p z^2 - r z + 0.5 r p - 0.125 q^2 = 0
+  float cc0 = 0.5*r*p - 0.125*q*q; float cc1 = -r; float cc2 = -0.5*p;
+  float z0, z1, z2; int zN = _torus_solve_cubic(cc2, cc1, cc0, z0, z1, z2);
+  // Choose z that yields non-negative u2 and v2 (within tolerance), prefer larger u2+v2
+  const float torus_eps = 1e-6;
+  float z = z0; bool z_ok = false; float bestScore = -1e30;
+  for (int i=0;i<3;i++){
+    float zc = (i==0? z0 : (i==1? z1 : z2));
+    if (i>=zN) break;
+    float u2c = zc*zc - r; float v2c = 2.0*zc - p;
+    if (u2c < 0.0 && u2c > -torus_eps) u2c = 0.0;
+    if (v2c < 0.0 && v2c > -torus_eps) v2c = 0.0;
+    if (u2c >= 0.0 && v2c >= 0.0){
+      float score = u2c + v2c;
+      if (!z_ok || score > bestScore){ z_ok = true; bestScore = score; z = zc; }
+    }
+  }
+  if (!z_ok) return 0;
+  float u2 = z*z - r; float v2 = 2.0*z - p;
+  if (u2 < 0.0 && u2 > -torus_eps) u2 = 0.0;
+  if (v2 < 0.0 && v2 > -torus_eps) v2 = 0.0;
+  float u = sqrt(max(u2,0.0)); float v = sqrt(max(v2,0.0));
+  float qa0 = z - u, qa1 = (q<0.0? -v : v), qa2 = 1.0; float qb0 = z + u, qb1 = (q<0.0?  v : -v), qb2 = 1.0;
+  float s0, s1; int nA = _torus_solve_quadratic(qa0, qa1, qa2, s0, s1);
+  float s2, s3; int nB = _torus_solve_quadratic(qb0, qb1, qb2, s2, s3);
+  int count = 0; if (nA>=1){ r0 = s0 - sub; count++; } if (nA>=2){ if(count==0) r0 = s1 - sub; else r1 = s1 - sub; count++; }
+  if (nB>=1){ if(count==0) r0 = s2 - sub; else if(count==1) r1 = s2 - sub; else r2 = s2 - sub; count++; }
+  if (nB>=2){ if(count==0) r0 = s3 - sub; else if(count==1) r1 = s3 - sub; else if(count==2) r2 = s3 - sub; else r3 = s3 - sub; count++; }
+  return count;
+}
+
+bool intersect_torus(const vec3 rayOrigin, const float ray_tmin,
+                     const vec3 rayDir, const float ray_tmax,
+                     const vec3 center, const vec3 xdirIn, const vec3 ydirIn,
+                     const float majorR, const float minorR,
+                     out float t, out vec3 normal){
+  vec3 xdir = normalize(xdirIn);
+  vec3 ydir = normalize(ydirIn - xdir*dot(ydirIn, xdir));
+  vec3 zdir = normalize(cross(xdir, ydir));
+  // Ray in local space
+  vec3 roW = rayOrigin - center; vec3 ro = vec3(dot(roW,xdir), dot(roW,ydir), dot(roW,zdir)); vec3 rd = vec3(dot(rayDir,xdir), dot(rayDir,ydir), dot(rayDir,zdir));
+  // Bounding ellipsoid pre-test (slightly relaxed) with optional shift fallback
+  float scale_factor = 1.6; float BBB = (majorR + minorR) * sqrt(minorR / max(2.0*majorR + minorR, 1e-6));
+  vec3 r2 = vec3((majorR + minorR)*(majorR + minorR) * scale_factor, BBB*BBB * scale_factor, (majorR + minorR)*(majorR + minorR) * scale_factor);
+  vec3 invr2 = 1.0 / r2; float aaa = dot(rd, rd*invr2); float bbb = dot(ro, rd*invr2); float ccc = dot(ro, ro*invr2); float disc = bbb*bbb - aaa*(ccc - 1.0);
+  float tShift = 0.0; vec3 ro_orig = ro;
+  if (disc >= 0.0){
+    float sd = sqrt(max(disc,0.0)); float t0 = (-bbb - sd)/max(aaa,1e-12); float t1 = (-bbb + sd)/max(aaa,1e-12);
+    float t_hit = 1e38; if (t0 > ray_tmin && t0 < t_hit) t_hit = t0; if (t1 > ray_tmin && t1 < t_hit) t_hit = t1;
+    if (t_hit >= ray_tmin && t_hit <= ray_tmax){ tShift = t_hit - 0.5; ro = ro + tShift * rd; }
+  }
+  // Quartic coefficients
+  float m = dot(rd, rd); float n = 2.0*dot(ro, rd); float k = dot(ro, ro) + majorR*majorR - minorR*minorR;
+  float D1 = 4.0*majorR*majorR*(rd.x*rd.x + rd.z*rd.z); float E1 = 8.0*majorR*majorR*(ro.x*rd.x + ro.z*rd.z); float F1 = 4.0*majorR*majorR*(ro.x*ro.x + ro.z*ro.z);
+  float a4 = m*m, a3 = 2.0*m*n, a2 = 2.0*m*k + n*n - D1, a1 = 2.0*n*k - E1, a0 = k*k - F1; if (abs(a4) < 1e-12) return false;
+  float A = a3/a4, B = a2/a4, C = a1/a4, D = a0/a4; float rA, rB, rC, rD; int num = _torus_solve_quartic_monic(A, B, C, D, rA, rB, rC, rD);
+  float best = 1e38; bool ok=false; float roots[4];
+  if (num > 0){ roots[0]=rA; roots[1]=rB; roots[2]=rC; roots[3]=rD; }
+  for (int i=0;i<num;i++){
+    float ttLoc = roots[i]; vec3 p = ro + rd*ttLoc; float tWorld = tShift + ttLoc; // stabilized reconstruction
+    float tEps = 1e-5; if (tWorld > ray_tmin + tEps && tWorld < best && tWorld < ray_tmax){ ok=true; best=tWorld; }
+  }
+  // Fallback: try solving without shift if nothing valid found
+  if (!ok){
+    ro = ro_orig; tShift = 0.0;
+    m = dot(rd, rd); n = 2.0*dot(ro, rd); k = dot(ro, ro) + majorR*majorR - minorR*minorR;
+    D1 = 4.0*majorR*majorR*(rd.x*rd.x + rd.z*rd.z); E1 = 8.0*majorR*majorR*(ro.x*rd.x + ro.z*rd.z); F1 = 4.0*majorR*majorR*(ro.x*ro.x + ro.z*ro.z);
+    a4 = m*m; a3 = 2.0*m*n; a2 = 2.0*m*k + n*n - D1; a1 = 2.0*n*k - E1; a0 = k*k - F1; if (abs(a4) < 1e-12) return false;
+    A = a3/a4; B = a2/a4; C = a1/a4; D = a0/a4; num = _torus_solve_quartic_monic(A, B, C, D, rA, rB, rC, rD);
+    if (num <= 0) return false; roots[0]=rA; roots[1]=rB; roots[2]=rC; roots[3]=rD;
+    for (int i=0;i<num;i++){
+      float ttLoc = roots[i]; vec3 p2 = ro + rd*ttLoc; float tWorld2 = tShift + ttLoc;
+      float tEps2 = 1e-5; if (tWorld2 > ray_tmin + tEps2 && tWorld2 < best && tWorld2 < ray_tmax){ ok=true; best=tWorld2; }
+    }
+    if (!ok) return false;
+  }
+  // Newton polish (1-2 iterations) on implicit F(t)=0 for torus to reduce grazing artifacts
+  float t_sel = best;
+  t = t_sel;
+  // Baseline residual at selected root
+  vec3 hp_sel = ro_orig + rd * t_sel; float cM = majorR, aM = minorR;
+  float Q_sel = dot(hp_sel, hp_sel) + cM*cM - aM*aM;
+  float F_sel = Q_sel*Q_sel - 4.0*cM*cM*(hp_sel.x*hp_sel.x + hp_sel.z*hp_sel.z);
+  float scale_sel = max(1.0, dot(hp_sel, hp_sel)); scale_sel *= scale_sel;
+  for (int it=0; it<2; ++it){
+    vec3 hp = ro_orig + rd * t;
+    float x = hp.x, y = hp.y, z = hp.z; float c = majorR, a = minorR;
+    float Q = x*x + y*y + z*z + c*c - a*a;
+    float F = Q*Q - 4.0*c*c*(x*x + z*z);
+    float dFdt = 4.0*( x*(Q - 2.0*c*c)*rd.x + y*Q*rd.y + z*(Q - 2.0*c*c)*rd.z );
+    if (abs(dFdt) < 1e-10) break;
+    float dt = F / dFdt;
+    // limit step to avoid overshoot
+    dt = clamp(dt, -0.25, 0.25);
+    float tNew = t - dt;
+    if (!(tNew > ray_tmin && tNew < ray_tmax)) break; // don't move outside range
+    t = tNew;
+  }
+  // Optional secant refinement if residual is still large (handles near-degenerate quartic roots)
+  {
+    vec3 hp0 = ro_orig + rd * t;
+    float x = hp0.x, y = hp0.y, z = hp0.z; float c = majorR, a = minorR;
+    float Q = x*x + y*y + z*z + c*c - a*a;
+    float F = Q*Q - 4.0*c*c*(x*x + z*z);
+    float scale = max(1.0, (x*x + y*y + z*z)); scale *= scale;
+    if (abs(F) > 1e-6 * scale){
+      float h = max(1e-3, 1e-3 * abs(t)); float t0 = clamp(t - h, ray_tmin + 1e-5, ray_tmax - 1e-5); float t1 = clamp(t + h, ray_tmin + 1e-5, ray_tmax - 1e-5);
+      vec3 hpL = ro_orig + rd * t0; vec3 hpR = ro_orig + rd * t1;
+      float QL = dot(hpL, hpL) + c*c - a*a; float FL = QL*QL - 4.0*c*c*(hpL.x*hpL.x + hpL.z*hpL.z);
+      float QR = dot(hpR, hpR) + c*c - a*a; float FR = QR*QR - 4.0*c*c*(hpR.x*hpR.x + hpR.z*hpR.z);
+      if (FL * FR <= 0.0){
+        // 3 secant iterations within [t0, t1]
+        float s0 = t0, s1 = t1; float f0 = FL, f1 = FR;
+        for (int it=0; it<3; ++it){
+          float denom = (f1 - f0);
+          if (abs(denom) < 1e-16) break;
+          float s2 = s1 - f1 * (s1 - s0) / denom;
+          s2 = clamp(s2, ray_tmin + 1e-5, ray_tmax - 1e-5);
+          vec3 hp2 = ro_orig + rd * s2; float Q2 = dot(hp2, hp2) + c*c - a*a; float F2 = Q2*Q2 - 4.0*c*c*(hp2.x*hp2.x + hp2.z*hp2.z);
+          s0 = s1; f0 = f1; s1 = s2; f1 = F2;
+        }
+        t = s1;
+      }
+    }
+  }
+  // If polish didn't improve residual or moved too far, revert to selected root
+  {
+    vec3 hp_pol = ro_orig + rd * t; float cP = majorR, aP = minorR;
+    float Q_pol = dot(hp_pol, hp_pol) + cP*cP - aP*aP;
+    float F_pol = Q_pol*Q_pol - 4.0*cP*cP*(hp_pol.x*hp_pol.x + hp_pol.z*hp_pol.z);
+    float scale_pol = max(1.0, dot(hp_pol, hp_pol)); scale_pol *= scale_pol;
+    float nSel = abs(F_sel) / scale_sel; float nPol = abs(F_pol) / scale_pol;
+    if (!(nPol < nSel) || abs(t - t_sel) > 5e-3) t = t_sel;
+  }
+  // Compute gradient-based normal in local space and rotate back to world
+  vec3 hp = ro_orig + rd * t;
+  float s = sqrt(max(hp.x*hp.x + hp.z*hp.z, 1e-12));
+  float aa = 1.0 - (majorR / s);
+  vec3 nloc = vec3(aa*hp.x, hp.y, aa*hp.z);
+  normal = normalize(nloc.x * xdir + nloc.y * ydir + nloc.z * zdir);
+  return true;
+}
+
+float intersect_torus(const vec3 rayOrigin, const float ray_tmin,
+                      const vec3 rayDir, const float ray_tmax,
+                      const vec3 center, const vec3 xdirIn, const vec3 ydirIn,
+                      const float majorR, const float minorR,
+                      out vec3 normal){ float t; vec3 n; bool hit = intersect_torus(rayOrigin, ray_tmin, rayDir, ray_tmax, center, xdirIn, ydirIn, majorR, minorR, t, n); normal=n; return hit? t : -1.0; }
+// =============================================================================
+
+// Angle-aware torus intersection: keeps only hits whose major-ring angle (in xdir–zdir plane) is within [0, angleDeg].
+bool intersect_torus_wedge(const vec3 rayOrigin, const float ray_tmin,
+                           const vec3 rayDir, const float ray_tmax,
+                           const vec3 center, const vec3 xdirIn, const vec3 ydirIn,
+                           const float majorR, const float minorR, const float angleDeg,
+                           out float t, out vec3 normal){
+  vec3 xdir = normalize(xdirIn);
+  vec3 ydir = normalize(ydirIn - xdir*dot(ydirIn, xdir));
+  vec3 zdir = normalize(cross(xdir, ydir));
+  // Ray in local space
+  vec3 roW = rayOrigin - center; vec3 ro = vec3(dot(roW,xdir), dot(roW,ydir), dot(roW,zdir)); vec3 rd = vec3(dot(rayDir,xdir), dot(rayDir,ydir), dot(rayDir,zdir));
+  // Bounding ellipsoid pre-test (match OptiX reference) with fallback
+  float scale_factor = 1.1; float BBB = (majorR + minorR) * sqrt(minorR / max(2.0*majorR + minorR, 1e-6));
+  vec3 r2 = vec3((majorR + minorR)*(majorR + minorR) * scale_factor, BBB*BBB * scale_factor, (majorR + minorR)*(majorR + minorR) * scale_factor);
+  vec3 invr2 = 1.0 / r2; float aaa = dot(rd, rd*invr2); float bbb = dot(ro, rd*invr2); float ccc = dot(ro, ro*invr2); float disc = bbb*bbb - aaa*(ccc - 1.0);
+  float tShift = 0.0; vec3 ro_orig = ro;
+  if (disc >= 0.0){
+    float sd = sqrt(max(disc,0.0)); float t0 = (-bbb - sd)/max(aaa,1e-12); float t1 = (-bbb + sd)/max(aaa,1e-12);
+    float t_hit = 1e38; if (t0 > ray_tmin && t0 < t_hit) t_hit = t0; if (t1 > ray_tmin && t1 < t_hit) t_hit = t1;
+    if (t_hit >= ray_tmin && t_hit <= ray_tmax){ tShift = t_hit - 0.5; ro = ro + tShift * rd; }
+  }
+  // Quartic coefficients
+  float m = dot(rd, rd); float n = 2.0*dot(ro, rd); float k = dot(ro, ro) + majorR*majorR - minorR*minorR;
+  float D1 = 4.0*majorR*majorR*(rd.x*rd.x + rd.z*rd.z); float E1 = 8.0*majorR*majorR*(ro.x*rd.x + ro.z*rd.z); float F1 = 4.0*majorR*majorR*(ro.x*ro.x + ro.z*ro.z);
+  float a4 = m*m, a3 = 2.0*m*n, a2 = 2.0*m*k + n*n - D1, a1 = 2.0*n*k - E1, a0 = k*k - F1; if (abs(a4) < 1e-12) return false;
+  float A = a3/a4, B = a2/a4, C = a1/a4, D = a0/a4; float rA, rB, rC, rD; int num = _torus_solve_quartic_monic(A, B, C, D, rA, rB, rC, rD);
+  if (num <= 0) return false; float best = 1e38; bool ok=false; float roots[4]; roots[0]=rA; roots[1]=rB; roots[2]=rC; roots[3]=rD;
+  for (int i=0;i<num;i++){
+    float ttLoc = roots[i]; vec3 p = ro + rd*ttLoc; float tWorld = tShift + ttLoc; // reconstruction like reference
+    float tEps = 2e-5;
+    if (tWorld <= ray_tmin + tEps || tWorld >= best || tWorld >= ray_tmax) continue;
+    // Wedge test in local major-ring plane using atan2 in radians, normalized to [0, 2π)
+    if (angleDeg < 360.0){
+      float theta = atan(p.z, p.x); if (theta < 0.0) theta += 2.0*3.14159265359;
+      float maxTheta = radians(clamp(angleDeg, 0.0, 360.0));
+      if (theta > maxTheta){
+        // Only relax near z≈0 when just over the boundary (prevents head-on side rings)
+        float angTol = 1e-3; // ~0.057 degrees
+        float zTol = 1e-5 * length(p.xz) + 1e-6;
+        float d = theta - maxTheta;
+        if (!(d <= angTol && abs(p.z) <= zTol)) continue;
+      }
+    }
+    ok = true; best = tWorld;
+  }
+  // Fallback: try unshifted quartic if nothing found (more robust near degeneracies)
+  if (!ok){
+    ro = ro_orig; tShift = 0.0;
+    m = dot(rd, rd); n = 2.0*dot(ro, rd); k = dot(ro, ro) + majorR*majorR - minorR*minorR;
+    D1 = 4.0*majorR*majorR*(rd.x*rd.x + rd.z*rd.z); E1 = 8.0*majorR*majorR*(ro.x*rd.x + ro.z*rd.z); F1 = 4.0*majorR*majorR*(ro.x*ro.x + ro.z*ro.z);
+    a4 = m*m; a3 = 2.0*m*n; a2 = 2.0*m*k + n*n - D1; a1 = 2.0*n*k - E1; a0 = k*k - F1; if (abs(a4) < 1e-12) return false;
+    A = a3/a4; B = a2/a4; C = a1/a4; D = a0/a4; num = _torus_solve_quartic_monic(A, B, C, D, rA, rB, rC, rD);
+    if (num <= 0) return false; roots[0]=rA; roots[1]=rB; roots[2]=rC; roots[3]=rD;
+    for (int i=0;i<num;i++){
+      float ttLoc = roots[i]; vec3 p2 = ro + rd*ttLoc; float tWorld2 = tShift + ttLoc;
+      float tEps2 = 2e-5;
+      if (tWorld2 <= ray_tmin + tEps2 || tWorld2 >= best || tWorld2 >= ray_tmax) continue;
+      if (angleDeg < 360.0){
+        float theta2 = atan(p2.z, p2.x); if (theta2 < 0.0) theta2 += 2.0*3.14159265359;
+        float maxTheta2 = radians(clamp(angleDeg, 0.0, 360.0));
+        if (theta2 > maxTheta2){
+          float angTol2 = 1e-3;
+          float zTol2 = 1e-5 * length(p2.xz) + 1e-6;
+          float d2 = theta2 - maxTheta2;
+          if (!(d2 <= angTol2 && abs(p2.z) <= zTol2)) continue;
+        }
+      }
+      ok = true; best = tWorld2;
+    }
+    if (!ok) return false;
+  }
+  // Final t with a light polish to stabilize near-grazing roots (no wedge re-check)
+  t = best;
+  for (int it=0; it<2; ++it){
+    vec3 hp2 = ro_orig + rd * t;
+    float x = hp2.x, y = hp2.y, z = hp2.z; float c = majorR, a = minorR;
+    float Q = x*x + y*y + z*z + c*c - a*a;
+    float F = Q*Q - 4.0*c*c*(x*x + z*z);
+    float dFdt = 4.0*( x*(Q - 2.0*c*c)*rd.x + y*Q*rd.y + z*(Q - 2.0*c*c)*rd.z );
+    if (abs(dFdt) < 1e-10) break;
+    float dt = clamp(F / dFdt, -0.25, 0.25);
+    float tNew = t - dt;
+    if (!(tNew > ray_tmin && tNew < ray_tmax)) break;
+    t = tNew;
+  }
+  // Optional short secant if residual remains large
+  {
+    vec3 hp0 = ro_orig + rd * t; float c = majorR, a = minorR;
+    float Q0 = dot(hp0, hp0) + c*c - a*a; float F0 = Q0*Q0 - 4.0*c*c*(hp0.x*hp0.x + hp0.z*hp0.z);
+    float scale = max(1.0, dot(hp0, hp0)); scale *= scale;
+    if (abs(F0) > 1e-6 * scale){
+      float h = max(1e-3, 1e-3 * abs(t)); float t0 = clamp(t - h, ray_tmin + 1e-5, ray_tmax - 1e-5); float t1 = clamp(t + h, ray_tmin + 1e-5, ray_tmax - 1e-5);
+      vec3 hpL = ro_orig + rd * t0; vec3 hpR = ro_orig + rd * t1;
+      float QL = dot(hpL, hpL) + c*c - a*a; float FL = QL*QL - 4.0*c*c*(hpL.x*hpL.x + hpL.z*hpL.z);
+      float QR = dot(hpR, hpR) + c*c - a*a; float FR = QR*QR - 4.0*c*c*(hpR.x*hpR.x + hpR.z*hpR.z);
+      if (FL * FR <= 0.0){
+        float s0 = t0, s1 = t1; float f0 = FL, f1 = FR;
+        for (int it=0; it<3; ++it){
+          float denom = (f1 - f0); if (abs(denom) < 1e-16) break;
+          float s2 = s1 - f1 * (s1 - s0) / denom;
+          s2 = clamp(s2, ray_tmin + 1e-5, ray_tmax - 1e-5);
+          vec3 hp2 = ro_orig + rd * s2; float Q2 = dot(hp2, hp2) + c*c - a*a; float F2 = Q2*Q2 - 4.0*c*c*(hp2.x*hp2.x + hp2.z*hp2.z);
+          s0 = s1; f0 = f1; s1 = s2; f1 = F2;
+        }
+        t = s1;
+      }
+    }
+  }
+  // Reconstruct t robustly by projection (reduces component-division jitter near silhouettes)
+  {
+    vec3 pfin = ro_orig + rd * t; vec3 dP = pfin - ro_orig; float denom = dot(rd, rd);
+    if (denom > 1e-20) t = dot(dP, rd) / denom;
+  }
+  // Normal via gradient as before
+  vec3 hp = ro_orig + rd * t; // note: ro_orig corresponds to unshifted origin
+  float s = sqrt(max(hp.x*hp.x + hp.z*hp.z, 1e-12));
+  float aa = 1.0 - (majorR / s);
+  vec3 nloc = vec3(aa*hp.x, hp.y, aa*hp.z);
+  normal = normalize(nloc.x * xdir + nloc.y * ydir + nloc.z * zdir);
+  return true;
+}
+
+float intersect_torus_wedge(const vec3 rayOrigin, const float ray_tmin,
+                            const vec3 rayDir, const float ray_tmax,
+                            const vec3 center, const vec3 xdirIn, const vec3 ydirIn,
+                            const float majorR, const float minorR, const float angleDeg,
+                            out vec3 normal){ float t; vec3 n; bool hit = intersect_torus_wedge(rayOrigin, ray_tmin, rayDir, ray_tmax, center, xdirIn, ydirIn, majorR, minorR, angleDeg, t, n); normal=n; return hit? t : -1.0; }

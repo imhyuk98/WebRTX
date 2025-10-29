@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebRTX 1920x1080 Minimal Render</title>
+    <style>
+      html, body { margin: 0; padding: 0; background: #111; }
+      canvas { display: block; margin: 0 auto; background: #000; image-rendering: pixelated; }
+    </style>
+  </head>
+  <body>
+    <!-- Fixed 1920x1080 canvas -->
+    <canvas id="gfx" width="1920" height="1080"></canvas>
+
+    <!-- Load WebRTX UMD bundle (patches WebGPU when requesting device with 'ray_tracing') -->
+    <script src="./dist/index.js"></script>
+
+    <!-- Minimal clear-only frame at 1920x1080 using WebGPU -->
+    <script type="module">
+      async function main() {
+        if (!('gpu' in navigator)) {
+          document.body.insertAdjacentHTML('beforeend', '<p style="color:#f55;text-align:center">WebGPU is not available in this browser.</p>');
+          return;
+        }
+
+        const canvas = /** @type {HTMLCanvasElement} */ (document.getElementById('gfx'));
+        const context = canvas.getContext('webgpu');
+        if (!context) {
+          document.body.insertAdjacentHTML('beforeend', '<p style="color:#f55;text-align:center">Failed to get WebGPU canvas context.</p>');
+          return;
+        }
+
+        // Adapter & device. Passing 'ray_tracing' triggers WebRTX patch hook (dist/index.js)
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) {
+          document.body.insertAdjacentHTML('beforeend', '<p style="color:#f55;text-align:center">No WebGPU adapter found.</p>');
+          return;
+        }
+
+        let device;
+        try {
+          device = await adapter.requestDevice({ requiredFeatures: ['ray_tracing'] });
+        } catch (e) {
+          // Fallback without the extension in case patching isn’t available
+          device = await adapter.requestDevice();
+        }
+
+        const format = navigator.gpu.getPreferredCanvasFormat();
+        context.configure({ device, format, alphaMode: 'opaque' });
+
+        // Single clear pass (no pipeline) to prove 1920x1080 rendering works
+        function frame(clearColor = { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }) {
+          const encoder = device.createCommandEncoder();
+          const pass = encoder.beginRenderPass({
+            colorAttachments: [{
+              view: context.getCurrentTexture().createView(),
+              clearValue: clearColor,
+              loadOp: 'clear',
+              storeOp: 'store',
+            }],
+          });
+          pass.end();
+          device.queue.submit([encoder.finish()]);
+        }
+
+        // Render a simple dark gradient once
+        const t = Date.now() * 0.001;
+        frame({ r: 0.05 + 0.05*Math.sin(t), g: 0.05, b: 0.08, a: 1.0 });
+      }
+
+      main();
+    </script>
+  </body>
+</html>

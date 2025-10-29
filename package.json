@@ -1,0 +1,35 @@
+{
+  "name": "webrtx",
+  "version": "0.1.1",
+  "description": "WebGPU Ray Tracing eXtension",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist/index.js",
+    "dist/index.d.ts",
+    "dist/types.d.ts",
+    "dist/*.wasm"
+  ],
+  "scripts": {
+    "prebuild": "cd glsl && wasm-pack build --target web && cd ../bvh && wasm-pack build --target web && cd ../naga && wasm-pack build --target web",
+    "build": "webpack --env production",
+    "build:dev": "webpack --env development",
+    "build:examples": "tsc -p tsconfig.examples.json",
+    "check_deps": "npx madge --circular --extensions ts ./",
+    "start": "npm run build:dev && npx http-server . -p 8085 -c -1"
+  },
+  "author": "codedhead@gmail.com",
+  "license": "MIT",
+  "devDependencies": {
+    "@webgpu/types": "^0.1.30",
+    "terser-webpack-plugin": "^5.3.14",
+    "ts-loader": "^9.2.7",
+    "typescript": "^4.6.2",
+    "webpack": "^5.77.0",
+    "webpack-cli": "^4.9.2",
+    "webpack-glsl-loader": "github:codedhead/webpack-glsl-loader"
+  },
+  "dependencies": {
+    "@webgpu/glslang": "github:codedhead/glslang.js"
+  }
+}

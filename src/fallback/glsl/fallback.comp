@@ -1,0 +1,713 @@
+#version 450
+
+// Use shared analytic intersection helpers
+#include "../../glsl/intersect.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform CameraUniform {
+	vec4 camPosNear;     // xyz = camera position, w = near plane
+	vec4 camForwardTan;  // xyz = forward, w = tan(fov * 0.5)
+	vec4 camRightAspect; // xyz = right, w = aspect
+	vec4 camUpFar;       // xyz = up, w = far plane
+	vec4 metrics0;       // x = primitive count, y = width, z = height, w = BVH nodes
+	vec4 metrics1;       // x = sphere count, y = cylinder count, z = circle count, w = ellipse count
+	vec4 metrics2;       // x = cone count, y = line count, z = torus count, w = plane count
+	vec4 metrics3;       // x = bezier count, y = bezier control count, z/w unused
+} uCamera;
+
+layout(set = 0, binding = 1) readonly buffer SphereBuffer {
+	vec4 spheres[]; // xyz = center, w = radius
+};
+
+layout(set = 0, binding = 2, rgba8) uniform writeonly image2D outputImage;
+
+layout(set = 0, binding = 3) readonly buffer BvhNodeBuffer {
+	uint bvhNodes[];
+};
+
+layout(set = 0, binding = 4) readonly buffer PrimitiveIndexBuffer {
+	uint primitiveIndices[];
+};
+
+layout(set = 0, binding = 5) readonly buffer PrimitiveRefBuffer {
+	uvec4 primitiveRefs[];
+};
+
+layout(set = 0, binding = 6) readonly buffer AnalyticBuffer {
+	vec4 analyticPrimitives[];
+};
+
+layout(set = 0, binding = 7) readonly buffer BezierBuffer {
+	vec4 bezierPrimitives[];
+};
+
+const int PRIM_TYPE_SPHERE = 0;
+const int PRIM_TYPE_CYLINDER = 1;
+const int PRIM_TYPE_CIRCLE = 2;
+const int PRIM_TYPE_ELLIPSE = 3;
+const int PRIM_TYPE_CONE = 4;
+const int PRIM_TYPE_LINE = 5;
+const int PRIM_TYPE_TORUS = 6;
+const int PRIM_TYPE_PLANE = 7;
+
+struct HitInfo {
+	float t;
+	vec3 normal;
+	int primitiveId;
+	int type;
+};
+
+HitInfo makeMiss() {
+	HitInfo hit;
+	hit.t = 1e30;
+	hit.normal = vec3(0.0);
+	hit.primitiveId = -1;
+	hit.type = -1;
+	return hit;
+}
+
+vec3 safeNormalize(vec3 v) {
+	float len = length(v);
+	if (len > 1e-5) {
+		return v / len;
+	}
+	return vec3(0.0, 1.0, 0.0);
+}
+
+const uint BVH_SENTINEL = 0xffffffffu;
+const int BVH_NODE_UINTS = 12;
+
+vec3 makeSafeInverse(vec3 dir) {
+	const float EPS = 1e-6;
+	vec3 safeDir = vec3(
+		abs(dir.x) > EPS ? dir.x : (dir.x >= 0.0 ? EPS : -EPS),
+		abs(dir.y) > EPS ? dir.y : (dir.y >= 0.0 ? EPS : -EPS),
+		abs(dir.z) > EPS ? dir.z : (dir.z >= 0.0 ? EPS : -EPS)
+	);
+	return 1.0 / safeDir;
+}
+
+bool intersectAabb(vec3 bmin, vec3 bmax, vec3 origin, vec3 invDir, float nearT, float farT) {
+	vec3 t0 = (bmin - origin) * invDir;
+	vec3 t1 = (bmax - origin) * invDir;
+	vec3 tmin = min(t0, t1);
+	vec3 tmax = max(t0, t1);
+	float entry = max(max(max(tmin.x, tmin.y), tmin.z), nearT);
+	float exit = min(min(min(tmax.x, tmax.y), tmax.z), farT);
+	return exit >= entry;
+}
+
+void evaluatePrimitive(
+	uvec4 ref,
+	uint primitiveSlot,
+	vec3 cameraPos,
+	float nearPlane,
+	vec3 rayDir,
+	float farPlane,
+	inout HitInfo closest,
+	int sphereCount,
+	int cylinderCount,
+	int circleCount,
+	int ellipseCount,
+	int coneCount,
+	int lineCount,
+	int torusCount,
+	int planeCount,
+	int analyticVec4Count
+){
+	int type = int(ref.x);
+	int idxInType = int(ref.y);
+	int analyticBase = int(ref.z);
+	float maxDistance = min(farPlane, closest.t);
+	if (maxDistance <= nearPlane) {
+		maxDistance = nearPlane + 1e-5;
+	}
+	switch (type) {
+		case PRIM_TYPE_SPHERE: {
+			if (idxInType < sphereCount) {
+				int sphereCapacity = spheres.length();
+				if (idxInType < sphereCapacity) {
+					vec4 s = spheres[idxInType];
+					float t;
+					vec3 rawNormal;
+					if (intersect_sphere(cameraPos, nearPlane, rayDir, maxDistance, s.xyz, s.w, t, rawNormal) && t < closest.t) {
+						closest.t = t;
+						closest.normal = safeNormalize(rawNormal);
+						closest.primitiveId = int(primitiveSlot);
+						closest.type = PRIM_TYPE_SPHERE;
+					}
+				}
+			}
+			break;
+		}
+		case PRIM_TYPE_CYLINDER: {
+			if (idxInType < cylinderCount) {
+				int analyticIndex = analyticBase + idxInType;
+				int vecIndex = analyticIndex * 3;
+				if (vecIndex + 2 < analyticVec4Count) {
+					vec4 c0 = analyticPrimitives[vecIndex + 0];
+					vec4 c1 = analyticPrimitives[vecIndex + 1];
+					vec4 c2 = analyticPrimitives[vecIndex + 2];
+					float angleDeg = (c2.w <= 0.0) ? 360.0 : c2.w;
+					float t;
+					vec3 normal;
+					if (intersect_cylinder(cameraPos, nearPlane, rayDir, maxDistance, c0.xyz, c1.xyz, c2.xyz, c0.w, c1.w, angleDeg, t, normal) && t < closest.t) {
+						closest.t = t;
+						closest.normal = safeNormalize(normal);
+						closest.primitiveId = int(primitiveSlot);
+						closest.type = PRIM_TYPE_CYLINDER;
+					}
+				}
+			}
+			break;
+		}
+		case PRIM_TYPE_CIRCLE: {
+			if (idxInType < circleCount) {
+				int analyticIndex = analyticBase + idxInType;
+				int vecIndex = analyticIndex * 3;
+				if (vecIndex + 2 < analyticVec4Count) {
+					vec4 c0 = analyticPrimitives[vecIndex + 0];
+					vec4 c1 = analyticPrimitives[vecIndex + 1];
+					vec4 c2 = analyticPrimitives[vecIndex + 2];
+					float t;
+					vec3 normal;
+					if (intersect_circle(cameraPos, nearPlane, rayDir, maxDistance, c0.xyz, c1.xyz, c2.xyz, c0.w, t, normal) && t < closest.t) {
+						closest.t = t;
+						closest.normal = safeNormalize(normal);
+						closest.primitiveId = int(primitiveSlot);
+						closest.type = PRIM_TYPE_CIRCLE;
+					}
+				}
+			}
+			break;
+		}
+		case PRIM_TYPE_ELLIPSE: {
+			if (idxInType < ellipseCount) {
+				int analyticIndex = analyticBase + idxInType;
+				int vecIndex = analyticIndex * 3;
+				if (vecIndex + 2 < analyticVec4Count) {
+					vec4 c0 = analyticPrimitives[vecIndex + 0];
+					vec4 c1 = analyticPrimitives[vecIndex + 1];
+					vec4 c2 = analyticPrimitives[vecIndex + 2];
+					float t;
+					vec3 normal;
+					if (intersect_ellipse(cameraPos, nearPlane, rayDir, maxDistance, c0.xyz, c1.xyz, c2.xyz, c0.w, c1.w, t, normal) && t < closest.t) {
+						closest.t = t;
+						closest.normal = safeNormalize(normal);
+						closest.primitiveId = int(primitiveSlot);
+						closest.type = PRIM_TYPE_ELLIPSE;
+					}
+				}
+			}
+			break;
+		}
+		case PRIM_TYPE_CONE: {
+			if (idxInType < coneCount) {
+				int analyticIndex = analyticBase + idxInType;
+				int vecIndex = analyticIndex * 3;
+				if (vecIndex + 2 < analyticVec4Count) {
+					vec4 c0 = analyticPrimitives[vecIndex + 0];
+					vec4 c1 = analyticPrimitives[vecIndex + 1];
+					vec4 c2 = analyticPrimitives[vecIndex + 2];
+					vec3 xdir = normalize(c1.xyz);
+					vec3 ydir = normalize(c2.xyz);
+					vec3 axis = normalize(cross(xdir, ydir));
+					float t;
+					vec3 normal;
+					if (intersect_cone_open(cameraPos, nearPlane, rayDir, maxDistance, c0.xyz, axis, c1.w, c0.w, t, normal) && t < closest.t) {
+						closest.t = t;
+						closest.normal = safeNormalize(normal);
+						closest.primitiveId = int(primitiveSlot);
+						closest.type = PRIM_TYPE_CONE;
+					}
+				}
+			}
+			break;
+		}
+		case PRIM_TYPE_LINE: {
+			if (idxInType < lineCount) {
+				int analyticIndex = analyticBase + idxInType;
+				int vecIndex = analyticIndex * 3;
+				if (vecIndex + 1 < analyticVec4Count) {
+					vec4 c0 = analyticPrimitives[vecIndex + 0];
+					vec4 c1 = analyticPrimitives[vecIndex + 1];
+					float radius = max(c0.w, 1e-4);
+					float t;
+					vec3 normal;
+					if (intersect_line_segment(cameraPos, nearPlane, rayDir, maxDistance, c0.xyz, c1.xyz, radius, t, normal) && t < closest.t) {
+						closest.t = t;
+						closest.normal = safeNormalize(normal);
+						closest.primitiveId = int(primitiveSlot);
+						closest.type = PRIM_TYPE_LINE;
+					}
+				}
+			}
+			break;
+		}
+		case PRIM_TYPE_TORUS: {
+			if (idxInType < torusCount) {
+				int analyticIndex = analyticBase + idxInType;
+				int vecIndex = analyticIndex * 3;
+				if (vecIndex + 2 < analyticVec4Count) {
+					vec4 c0 = analyticPrimitives[vecIndex + 0];
+					vec4 c1 = analyticPrimitives[vecIndex + 1];
+					vec4 c2 = analyticPrimitives[vecIndex + 2];
+					float angleDeg = c2.w;
+					float t;
+					vec3 normal;
+					bool hit;
+					if (angleDeg >= 0.0 && angleDeg < 359.5) {
+						hit = intersect_torus_wedge(cameraPos, nearPlane, rayDir, maxDistance, c0.xyz, c1.xyz, c2.xyz, c0.w, c1.w, angleDeg, t, normal);
+					} else {
+						hit = intersect_torus(cameraPos, nearPlane, rayDir, maxDistance, c0.xyz, c1.xyz, c2.xyz, c0.w, c1.w, t, normal);
+					}
+					if (hit && t < closest.t) {
+						closest.t = t;
+						closest.normal = safeNormalize(normal);
+						closest.primitiveId = int(primitiveSlot);
+						closest.type = PRIM_TYPE_TORUS;
+					}
+				}
+			}
+			break;
+		}
+		case PRIM_TYPE_PLANE: {
+			if (idxInType < planeCount) {
+				int analyticIndex = analyticBase + idxInType;
+				int vecIndex = analyticIndex * 3;
+				if (vecIndex + 2 < analyticVec4Count) {
+					vec4 c0 = analyticPrimitives[vecIndex + 0];
+					vec4 c1 = analyticPrimitives[vecIndex + 1];
+					vec4 c2 = analyticPrimitives[vecIndex + 2];
+					float t;
+					vec3 normal;
+					if (intersect_plane_rect(cameraPos, nearPlane, rayDir, maxDistance, c0.xyz, c1.xyz, c2.xyz, c0.w, c1.w, t, normal) && t < closest.t) {
+						if (dot(normal, rayDir) > 0.0) {
+							normal = -normal;
+						}
+						closest.t = t;
+						closest.normal = safeNormalize(normal);
+						closest.primitiveId = int(primitiveSlot);
+						closest.type = PRIM_TYPE_PLANE;
+					}
+				}
+			}
+			break;
+		}
+		default:
+			break;
+	}
+}
+
+void traverseBvh(
+	vec3 cameraPos,
+	float nearPlane,
+	vec3 rayDir,
+	float farPlane,
+	inout HitInfo closest,
+	int sphereCount,
+	int cylinderCount,
+	int circleCount,
+	int ellipseCount,
+	int coneCount,
+	int lineCount,
+	int torusCount,
+	int planeCount,
+	int analyticVec4Count,
+	int primitiveCount,
+	int metricNodeCount
+){
+	if (primitiveCount <= 0 || metricNodeCount <= 0) {
+		return;
+	}
+	int totalNodeCount = bvhNodes.length() / BVH_NODE_UINTS;
+	if (totalNodeCount <= 0) {
+		return;
+	}
+	int actualNodeCount = min(metricNodeCount, totalNodeCount);
+	if (actualNodeCount <= 0) {
+		return;
+	}
+	uint nodeCountU = uint(actualNodeCount);
+	vec3 invDir = makeSafeInverse(rayDir);
+	float nearT = max(nearPlane, 0.0);
+	uint nodeIndex = 0u;
+	int maxIterations = actualNodeCount * 4 + 8;
+	for (int iter = 0; iter < maxIterations && nodeIndex != BVH_SENTINEL; ++iter) {
+		int nodeBase = int(nodeIndex) * BVH_NODE_UINTS;
+		if (nodeBase + BVH_NODE_UINTS > bvhNodes.length()) {
+			break;
+		}
+		vec3 nodeMin = vec3(
+			uintBitsToFloat(bvhNodes[nodeBase + 0]),
+			uintBitsToFloat(bvhNodes[nodeBase + 1]),
+			uintBitsToFloat(bvhNodes[nodeBase + 2])
+		);
+		vec3 nodeMax = vec3(
+			uintBitsToFloat(bvhNodes[nodeBase + 4]),
+			uintBitsToFloat(bvhNodes[nodeBase + 5]),
+			uintBitsToFloat(bvhNodes[nodeBase + 6])
+		);
+		uint entryRaw = bvhNodes[nodeBase + 8];
+		uint exitRaw = bvhNodes[nodeBase + 9];
+		uint primitiveIndexRaw = bvhNodes[nodeBase + 10];
+		uint leafFlag = bvhNodes[nodeBase + 11];
+		uint entryNode = (entryRaw < nodeCountU) ? entryRaw : BVH_SENTINEL;
+		uint exitNode = (exitRaw < nodeCountU) ? exitRaw : BVH_SENTINEL;
+		float farLimit = min(farPlane, closest.t);
+		if (farLimit <= nearT) {
+			farLimit = nearT + 1e-5;
+		}
+		bool intersects = intersectAabb(nodeMin, nodeMax, cameraPos, invDir, nearT, farLimit);
+		if (intersects) {
+			if (leafFlag != 0u) {
+				uint primitiveSlot = primitiveIndexRaw;
+				int indexLength = primitiveIndices.length();
+				if (indexLength > 0 && primitiveIndexRaw < uint(indexLength)) {
+					primitiveSlot = primitiveIndices[primitiveIndexRaw];
+				}
+				if (primitiveSlot != BVH_SENTINEL) {
+					int refLength = primitiveRefs.length();
+					if (refLength > 0 && primitiveSlot < uint(refLength) && int(primitiveSlot) < primitiveCount) {
+						uvec4 ref = primitiveRefs[primitiveSlot];
+						evaluatePrimitive(ref, primitiveSlot, cameraPos, nearPlane, rayDir, farPlane, closest,
+							sphereCount, cylinderCount, circleCount, ellipseCount,
+							coneCount, lineCount, torusCount, planeCount, analyticVec4Count);
+					}
+				}
+				nodeIndex = exitNode;
+			} else {
+				if (entryNode != BVH_SENTINEL) {
+					nodeIndex = entryNode;
+					continue;
+				}
+				nodeIndex = exitNode;
+			}
+		} else {
+			nodeIndex = exitNode;
+		}
+	}
+}
+
+vec3 shade(vec3 normal, vec3 viewDir, int primType) {
+	vec3 lightDir = normalize(vec3(0.4, 0.8, 0.2));
+	float diffuse = max(dot(normal, lightDir), 0.0);
+	float fresnel = pow(1.0 - max(dot(normal, -viewDir), 0.0), 3.0);
+	vec3 baseColor = vec3(0.82, 0.36, 0.24);
+	switch (primType) {
+		case PRIM_TYPE_SPHERE: baseColor = vec3(0.82, 0.36, 0.24); break;
+		case PRIM_TYPE_CYLINDER: baseColor = vec3(0.32, 0.62, 0.88); break;
+		case PRIM_TYPE_CIRCLE: baseColor = vec3(0.35, 0.75, 0.55); break;
+		case PRIM_TYPE_ELLIPSE: baseColor = vec3(0.88, 0.54, 0.26); break;
+		case PRIM_TYPE_CONE: baseColor = vec3(0.70, 0.45, 0.85); break;
+		case PRIM_TYPE_LINE: baseColor = vec3(0.90, 0.82, 0.32); break;
+		case PRIM_TYPE_TORUS: baseColor = vec3(0.40, 0.80, 0.92); break;
+		case PRIM_TYPE_PLANE: baseColor = vec3(0.55, 0.62, 0.68); break;
+		default: baseColor = vec3(0.7, 0.7, 0.7); break;
+	}
+	vec3 lit = baseColor * (0.2 + 0.8 * diffuse);
+	return mix(lit, vec3(1.0), fresnel * 0.3);
+}
+
+void main() {
+	uvec2 gid = gl_GlobalInvocationID.xy;
+
+	float width = uCamera.metrics0.y;
+	float height = uCamera.metrics0.z;
+
+	if (gid.x >= uint(width) || gid.y >= uint(height)) {
+		return;
+	}
+
+	int heightInt = int(height + 0.5);
+	ivec2 storeCoord = ivec2(int(gid.x), heightInt - 1 - int(gid.y));
+
+	vec2 pixel = vec2(gid) + vec2(0.5);
+	vec2 ndc;
+	ndc.x = pixel.x / max(width, 1.0);
+	ndc.y = pixel.y / max(height, 1.0);
+	ndc = ndc * 2.0 - 1.0;
+	ndc.y = -ndc.y;
+
+	vec3 cameraPos = uCamera.camPosNear.xyz;
+	vec3 forward = normalize(uCamera.camForwardTan.xyz);
+	vec3 right = normalize(uCamera.camRightAspect.xyz);
+	vec3 up = normalize(uCamera.camUpFar.xyz);
+	float tanHalfFov = uCamera.camForwardTan.w;
+	float aspect = max(uCamera.camRightAspect.w, 1e-4);
+
+	vec3 rayDir = normalize(
+		forward +
+		ndc.x * aspect * tanHalfFov * right +
+		ndc.y * tanHalfFov * up
+	);
+
+	int primitiveCount = int(uCamera.metrics0.x + 0.5);
+	HitInfo closest = makeMiss();
+	int sphereCount = int(uCamera.metrics1.x + 0.5);
+	int cylinderCount = int(uCamera.metrics1.y + 0.5);
+	int circleCount = int(uCamera.metrics1.z + 0.5);
+	int ellipseCount = int(uCamera.metrics1.w + 0.5);
+	int coneCount = int(uCamera.metrics2.x + 0.5);
+	int lineCount = int(uCamera.metrics2.y + 0.5);
+	int torusCount = int(uCamera.metrics2.z + 0.5);
+	int planeCount = int(uCamera.metrics2.w + 0.5);
+	int analyticVec4Count = int(analyticPrimitives.length());
+
+	int analyticBaseCylinder = 0;
+	int analyticBaseCircle = analyticBaseCylinder + cylinderCount;
+	int analyticBaseEllipse = analyticBaseCircle + circleCount;
+	int analyticBaseCone = analyticBaseEllipse + ellipseCount;
+	int analyticBaseLine = analyticBaseCone + coneCount;
+	int analyticBaseTorus = analyticBaseLine + lineCount;
+	int analyticBasePlane = analyticBaseTorus + torusCount;
+
+	// Touch all storage buffers so that translators keep bindings alive even when
+	// the shader path does not actively consume them. Removing these guards would
+	// cause dead-code elimination to drop the bindings and break the pipeline.
+	if (uCamera.metrics0.x < -1.0) {
+		uint guard = 0u;
+		guard += uint(bvhNodes.length());
+		guard += uint(primitiveIndices.length());
+		guard += uint(primitiveRefs.length());
+		guard += uint(analyticPrimitives.length());
+		guard += uint(bezierPrimitives.length());
+		if (guard == 0u) {
+			imageStore(outputImage, ivec2(0), vec4(0.0));
+		}
+	}
+
+	float nearPlane = max(uCamera.camPosNear.w, 1e-4);
+	float farPlane = uCamera.camUpFar.w;
+	if (farPlane <= nearPlane) {
+		farPlane = 1e30;
+	}
+
+	int metricNodeCount = int(uCamera.metrics0.w + 0.5);
+	int totalNodeCount = bvhNodes.length() / BVH_NODE_UINTS;
+	int primitiveRefCount = primitiveRefs.length();
+	bool canUseBvh = primitiveCount > 0 && metricNodeCount > 0 && totalNodeCount > 0 && primitiveRefCount > 0;
+	if (canUseBvh && primitiveCount > primitiveRefCount) {
+		canUseBvh = false;
+	}
+
+	if (canUseBvh) {
+		traverseBvh(
+			cameraPos,
+			nearPlane,
+			rayDir,
+			farPlane,
+			closest,
+			sphereCount,
+			cylinderCount,
+			circleCount,
+			ellipseCount,
+			coneCount,
+			lineCount,
+			torusCount,
+			planeCount,
+			analyticVec4Count,
+			primitiveCount,
+			metricNodeCount
+		);
+	} else {
+		for (int i = 0; i < sphereCount; ++i) {
+			if (i >= spheres.length()) {
+				break;
+			}
+			float t;
+			vec3 rawNormal;
+			bool hit = intersect_sphere(cameraPos, nearPlane, rayDir, farPlane,
+									 spheres[i].xyz, spheres[i].w, t, rawNormal);
+			if (hit && t < closest.t) {
+				closest.t = t;
+				closest.normal = safeNormalize(rawNormal);
+				closest.primitiveId = i;
+				closest.type = PRIM_TYPE_SPHERE;
+			}
+		}
+
+		for (int i = 0; i < cylinderCount; ++i) {
+			int vecIndex = (analyticBaseCylinder + i) * 3;
+			if (vecIndex + 2 >= analyticVec4Count) { break; }
+			vec4 c0 = analyticPrimitives[vecIndex + 0];
+			vec4 c1 = analyticPrimitives[vecIndex + 1];
+			vec4 c2 = analyticPrimitives[vecIndex + 2];
+			float t;
+			vec3 normal;
+			float angleDeg = (c2.w <= 0.0) ? 360.0 : c2.w;
+			bool hit = intersect_cylinder(
+				cameraPos, nearPlane, rayDir, farPlane,
+				c0.xyz, c1.xyz, c2.xyz,
+				c0.w, c1.w, angleDeg,
+				t, normal
+			);
+			if (hit && t < closest.t) {
+				closest.t = t;
+				closest.normal = safeNormalize(normal);
+				closest.primitiveId = i;
+				closest.type = PRIM_TYPE_CYLINDER;
+			}
+		}
+
+		for (int i = 0; i < circleCount; ++i) {
+			int vecIndex = (analyticBaseCircle + i) * 3;
+			if (vecIndex + 2 >= analyticVec4Count) { break; }
+			vec4 c0 = analyticPrimitives[vecIndex + 0];
+			vec4 c1 = analyticPrimitives[vecIndex + 1];
+			vec4 c2 = analyticPrimitives[vecIndex + 2];
+			float t;
+			vec3 normal;
+			bool hit = intersect_circle(
+				cameraPos, nearPlane, rayDir, farPlane,
+				c0.xyz, c1.xyz, c2.xyz, c0.w,
+				t, normal
+			);
+			if (hit && t < closest.t) {
+				closest.t = t;
+				closest.normal = safeNormalize(normal);
+				closest.primitiveId = i;
+				closest.type = PRIM_TYPE_CIRCLE;
+			}
+		}
+
+		for (int i = 0; i < ellipseCount; ++i) {
+			int vecIndex = (analyticBaseEllipse + i) * 3;
+			if (vecIndex + 2 >= analyticVec4Count) { break; }
+			vec4 c0 = analyticPrimitives[vecIndex + 0];
+			vec4 c1 = analyticPrimitives[vecIndex + 1];
+			vec4 c2 = analyticPrimitives[vecIndex + 2];
+			float t;
+			vec3 normal;
+			bool hit = intersect_ellipse(
+				cameraPos, nearPlane, rayDir, farPlane,
+				c0.xyz, c1.xyz, c2.xyz,
+				c0.w, c1.w,
+				t, normal
+			);
+			if (hit && t < closest.t) {
+				closest.t = t;
+				closest.normal = safeNormalize(normal);
+				closest.primitiveId = i;
+				closest.type = PRIM_TYPE_ELLIPSE;
+			}
+		}
+
+		for (int i = 0; i < coneCount; ++i) {
+			int vecIndex = (analyticBaseCone + i) * 3;
+			if (vecIndex + 2 >= analyticVec4Count) { break; }
+			vec4 c0 = analyticPrimitives[vecIndex + 0];
+			vec4 c1 = analyticPrimitives[vecIndex + 1];
+			vec4 c2 = analyticPrimitives[vecIndex + 2];
+			vec3 xdir = normalize(c1.xyz);
+			vec3 ydir = normalize(c2.xyz);
+			vec3 axis = normalize(cross(xdir, ydir));
+			float t;
+			vec3 normal;
+			bool hit = intersect_cone_open(
+				cameraPos, nearPlane, rayDir, farPlane,
+				c0.xyz, axis, c1.w, c0.w,
+				t, normal
+			);
+			if (hit && t < closest.t) {
+				closest.t = t;
+				closest.normal = safeNormalize(normal);
+				closest.primitiveId = i;
+				closest.type = PRIM_TYPE_CONE;
+			}
+		}
+
+		for (int i = 0; i < lineCount; ++i) {
+			int vecIndex = (analyticBaseLine + i) * 3;
+			if (vecIndex + 1 >= analyticVec4Count) { break; }
+			vec4 c0 = analyticPrimitives[vecIndex + 0];
+			vec4 c1 = analyticPrimitives[vecIndex + 1];
+			float radius = max(c0.w, 1e-4);
+			float t;
+			vec3 normal;
+			bool hit = intersect_line_segment(
+				cameraPos, nearPlane, rayDir, farPlane,
+				c0.xyz, c1.xyz, radius,
+				t, normal
+			);
+			if (hit && t < closest.t) {
+				closest.t = t;
+				closest.normal = safeNormalize(normal);
+				closest.primitiveId = i;
+				closest.type = PRIM_TYPE_LINE;
+			}
+		}
+
+		for (int i = 0; i < torusCount; ++i) {
+			int vecIndex = (analyticBaseTorus + i) * 3;
+			if (vecIndex + 2 >= analyticVec4Count) { break; }
+			vec4 c0 = analyticPrimitives[vecIndex + 0];
+			vec4 c1 = analyticPrimitives[vecIndex + 1];
+			vec4 c2 = analyticPrimitives[vecIndex + 2];
+			float angleDeg = c2.w;
+			float t;
+			vec3 normal;
+			bool hit;
+			if (angleDeg >= 0.0 && angleDeg < 359.5) {
+				hit = intersect_torus_wedge(
+					cameraPos, nearPlane, rayDir, farPlane,
+					c0.xyz, c1.xyz, c2.xyz, c0.w, c1.w, angleDeg,
+					t, normal
+				);
+			} else {
+				hit = intersect_torus(
+					cameraPos, nearPlane, rayDir, farPlane,
+					c0.xyz, c1.xyz, c2.xyz, c0.w, c1.w,
+					t, normal
+				);
+			}
+			if (hit && t < closest.t) {
+				closest.t = t;
+				closest.normal = safeNormalize(normal);
+				closest.primitiveId = i;
+				closest.type = PRIM_TYPE_TORUS;
+			}
+		}
+
+		for (int i = 0; i < planeCount; ++i) {
+			int vecIndex = (analyticBasePlane + i) * 3;
+			if (vecIndex + 2 >= analyticVec4Count) { break; }
+			vec4 c0 = analyticPrimitives[vecIndex + 0];
+			vec4 c1 = analyticPrimitives[vecIndex + 1];
+			vec4 c2 = analyticPrimitives[vecIndex + 2];
+			float t;
+			vec3 normal;
+			bool hit = intersect_plane_rect(
+				cameraPos, nearPlane, rayDir, farPlane,
+				c0.xyz, c1.xyz, c2.xyz,
+				c0.w, c1.w,
+				t, normal
+			);
+			if (hit && t < closest.t) {
+				if (dot(normal, rayDir) > 0.0) {
+					normal = -normal;
+				}
+				closest.t = t;
+				closest.normal = safeNormalize(normal);
+				closest.primitiveId = i;
+				closest.type = PRIM_TYPE_PLANE;
+			}
+		}
+	}
+
+	vec3 color;
+	if (closest.primitiveId >= 0) {
+		vec3 hitPos = cameraPos + rayDir * closest.t;
+		vec3 viewDir = normalize(cameraPos - hitPos);
+		vec3 normal = safeNormalize(closest.normal);
+		color = shade(normal, viewDir, closest.type);
+	} else {
+		vec3 skyA = vec3(0.03, 0.05, 0.08);
+		vec3 skyB = vec3(0.32, 0.45, 0.68);
+		float t = clamp(rayDir.y * 0.5 + 0.5, 0.0, 1.0);
+		color = mix(skyA, skyB, t);
+	}
+
+	imageStore(outputImage, storeCoord, vec4(color, 1.0));
+}

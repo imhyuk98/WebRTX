@@ -1,0 +1,18 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./examples",
+    "target": "ES2020",
+    "module": "ES2020",
+    "moduleResolution": "node",
+    "declaration": false,
+    "isolatedModules": true,
+    "types": ["@webgpu/types"],
+    "skipLibCheck": true
+  },
+  "include": [
+    "examples/**/*.ts",
+    "dist/index.d.ts"
+  ],
+  "exclude": ["node_modules", "dist", "bvh", "glsl", "naga"]
+}
