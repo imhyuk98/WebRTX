@@ -4,56 +4,75 @@ import type { FallbackSceneDescriptor, SphereInstance } from './fallback/scene_d
 
 function createDefaultSceneDescriptor(): FallbackSceneDescriptor {
   return {
-    spheres: [{ center: [0, 0, 0], radius: 1.2 }],
+    spheres: [{ center: [-9.0, -0.2, -3.0], radius: 1.1 }],
     cylinders: [{
-      center: [1.8, 0.0, 0.0],
+      center: [-6.0, -1.0, -3.0],
       xdir: [1.0, 0.0, 0.0],
       ydir: [0.0, 0.0, -1.0],
-      radius: 0.4,
-      height: 2.0,
+      radius: 0.65,
+      height: 2.8,
       angleDeg: 360.0,
     }],
     circles: [{
-      center: [-1.8, 0.0, 0.0],
+      center: [-3.0, 0.0, -3.0],
       xdir: [1.0, 0.0, 0.0],
       ydir: [0.0, 1.0, 0.0],
-      radius: 0.9,
+      radius: 1.3,
     }],
     ellipses: [{
-      center: [-4.0, 0.0, 0.0],
-      xdir: [1.0, 0.0, 0.0],
-      ydir: [0.0, 1.0, 0.0],
-      radiusX: 0.9,
-      radiusY: 0.5,
+      center: [0.0, 0.0, -3.0],
+      xdir: [0.96, 0.20, 0.08],
+      ydir: [-0.10, 0.96, 0.25],
+      radiusX: 1.4,
+      radiusY: 0.7,
     }],
     cones: [{
-      center: [0.0, -1.0, -1.2],
+      center: [3.0, -1.4, -3.0],
       xdir: [1.0, 0.0, 0.0],
       ydir: [0.0, 0.0, 1.0],
-      radius: 0.7,
-      height: 1.6,
+      radius: 0.9,
+      height: 2.4,
     }],
     lines: [{
-      p0: [-2.8, 0.8, -0.5],
-      p1: [-1.6, 1.6, -0.2],
-      radius: 0.001,
+      p0: [5.8, -0.8, -3.0],
+      p1: [6.6, 1.4, -3.0],
+      radius: 0.025,
     }],
     tori: [{
-      center: [4.0, 0.2, 0.0],
-      xdir: [1.0, 0.0, 0.0],
-      ydir: [0.0, 1.0, 0.0],
-      majorRadius: 0.9,
-      minorRadius: 0.25,
+      center: [9.0, -0.1, -3.0],
+      xdir: [0.97, 0.04, 0.23],
+      ydir: [-0.06, 0.98, 0.18],
+      majorRadius: 1.3,
+      minorRadius: 0.32,
       angleDeg: 360.0,
     }],
     planes: [{
-      center: [0.0, -2.0, 0.0],
+      center: [0.0, -3.8, -3.0],
       xdir: [1.0, 0.0, 0.0],
       ydir: [0.0, 0.0, 1.0],
-      halfWidth: 10.0,
-      halfHeight: 10.0,
+      halfWidth: 45.0,
+      halfHeight: 45.0,
     }],
-    bezierPatches: [],
+    bezierPatches: [{
+      p00: [-2.0, -1.2, 2.5],
+      p10: [-0.5, -0.8, 3.2],
+      p01: [0.5, -0.6, 2.0],
+      p11: [1.8, -0.5, 2.8],
+      du00: [2.2, 0.3, 0.5],
+      du10: [2.4, 0.5, 0.9],
+      du01: [2.2, 0.6, -0.3],
+      du11: [2.1, 0.7, -0.2],
+      dv00: [0.3, 0.2, -1.9],
+      dv10: [-0.5, 0.5, -2.1],
+      dv01: [0.6, 0.3, -1.7],
+      dv11: [-0.6, 0.4, -2.0],
+      duv00: [0.2, 0.1, 0.3],
+      duv10: [-0.2, 0.1, -0.3],
+      duv01: [0.3, 0.0, 0.4],
+      duv11: [-0.3, 0.1, 0.3],
+      maxDepth: 6,
+      pixelEpsilon: 2.0,
+    }],
   };
 }
 
@@ -132,11 +151,12 @@ export async function runInteractiveScene(canvas: HTMLCanvasElement | string, op
         await result.setScene(createDefaultSceneDescriptor());
       } else if (sceneIndex === 1) {
         const baseDescriptor = createSphereGridBaseDescriptor();
-        await result.setScene(baseDescriptor);
+        baseDescriptor.planes = [];
+          await result.setScene(baseDescriptor);
         if (!cachedSphereGrid) {
-          console.time('[Interactive] Generating 20x20x20 sphere grid');
-          cachedSphereGrid = generateSphereGridInstances(20, 20, 20, 0.12, 0.35);
-          console.timeEnd('[Interactive] Generating 20x20x20 sphere grid');
+          console.time('[Interactive] Generating 100x100x100 sphere grid');
+          cachedSphereGrid = generateSphereGridInstances(100, 100, 100, 0.12, 0.35);
+          console.timeEnd('[Interactive] Generating 100x100x100 sphere grid');
         }
         await result.setSpheres(cachedSphereGrid);
       } else {
@@ -161,7 +181,7 @@ export async function runInteractiveScene(canvas: HTMLCanvasElement | string, op
     }
   };
   window.addEventListener('keydown', handleSceneKey);
-  console.log('[Interactive] Scene hotkeys: [1] default demo, [2] 20x20x20 sphere grid');
+  console.log('[Interactive] Scene hotkeys: [1] default demo, [2] 100x100x100 sphere grid');
   let last = performance.now();
   let stopped = false;
   async function frame() {

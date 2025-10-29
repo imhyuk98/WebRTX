@@ -162,7 +162,7 @@ bool intersect_circle(const vec3 rayOrigin, const float ray_tmin,
                       out float t, out vec3 normal) {
   // Orthonormalize lightweight (mirror of cylinder approach)
   vec3 xdir = normalize(xdirIn);
-  vec3 ydir = normalize(ydirIn - xdir * dot(xdirIn, xdir));
+  vec3 ydir = normalize(ydirIn - xdir * dot(ydirIn, xdir));
   normal = normalize(cross(xdir, ydir));
   float denom = dot(rayDir, normal);
   if (abs(denom) < 5e-6) { return false; }
@@ -203,7 +203,7 @@ bool intersect_ellipse(const vec3 rayOrigin, const float ray_tmin,
                        out float t, out vec3 normal) {
   // Orthonormalize lightweight
   vec3 xdir = normalize(xdirIn);
-  vec3 ydir = normalize(ydirIn - xdir * dot(xdirIn, xdir));
+  vec3 ydir = normalize(ydirIn - xdir * dot(ydirIn, xdir));
   normal = normalize(cross(xdir, ydir));
   float denom = dot(rayDir, normal);
   if (abs(denom) < 1e-6) { return false; }

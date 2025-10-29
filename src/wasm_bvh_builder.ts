@@ -39,17 +39,95 @@ export interface BuiltAabbBlasNodes {
 
 let warnedMissingAabbBuilder = false;
 
-export async function buildAabbBlasNodes(_aabbData: ArrayLike<number>): Promise<BuiltAabbBlasNodes> {
+function copyArrayLikeToFloat32(dst: Float32Array, source: ArrayLike<number>): void {
+  const length = Math.min(dst.length, source.length ?? 0);
+  for (let i = 0; i < length; i++) {
+    dst[i] = Number(source[i]) || 0;
+  }
+}
+
+const enum GeometryDescriptorField {
+  Type = 0,
+  NumPrimitives = 1,
+  VbufId = 2,
+  VbufByteOffset = 3,
+  IbufId = 4,
+  IbufByteOffset = 5,
+  Count = 6,
+}
+
+const GEOMETRY_TYPE_AABB = 1;
+const FLOATS_PER_AABB = 6;
+const BYTES_PER_AABB = FLOATS_PER_AABB * Float32Array.BYTES_PER_ELEMENT;
+
+export async function buildAabbBlasNodes(aabbData: ArrayLike<number>): Promise<BuiltAabbBlasNodes> {
+  let wasmModule: BvhWasmModule | undefined;
   try {
-    await loadBvhWasmModule();
-  } catch {
-    // Swallow load errors and fall back to linear traversal.
+    wasmModule = await loadBvhWasmModule();
+  } catch (error) {
+    if (!warnedMissingAabbBuilder) {
+      warnedMissingAabbBuilder = true;
+      debugWarn('[WebRTX] BVH wasm module unavailable; fallback renderer will traverse linearly.', error);
+    }
+    return { nodeCount: 0, nodeData: new Uint8Array(0) };
   }
-  if (!warnedMissingAabbBuilder && typeof console !== 'undefined') {
-    warnedMissingAabbBuilder = true;
-    debugWarn('[WebRTX] BVH wasm module unavailable; fallback renderer will traverse linearly.');
+
+  if (!wasmModule) {
+    if (!warnedMissingAabbBuilder) {
+      warnedMissingAabbBuilder = true;
+      debugWarn('[WebRTX] BVH wasm module unavailable; fallback renderer will traverse linearly.');
+    }
+    return { nodeCount: 0, nodeData: new Uint8Array(0) };
   }
-  return { nodeCount: 0, nodeData: new Uint8Array(0) };
+
+  const primitiveCount = Math.floor((aabbData?.length ?? 0) / FLOATS_PER_AABB);
+  if (primitiveCount <= 0) {
+    return { nodeCount: 0, nodeData: new Uint8Array(0) };
+  }
+
+  let descriptorBuffer: StagingBuffer | null = null;
+  let aabbBuffer: StagingBuffer | null = null;
+  try {
+    aabbBuffer = allocateStagingBuffer(primitiveCount * BYTES_PER_AABB);
+    const aabbView = aabbBuffer.f32_view();
+    copyArrayLikeToFloat32(aabbView, aabbData);
+
+    descriptorBuffer = allocateStagingBuffer(
+      Int32Array.BYTES_PER_ELEMENT * (2 + primitiveCount * GeometryDescriptorField.Count),
+    );
+    const descriptorView = descriptorBuffer.i32_view();
+    descriptorView[0] = primitiveCount;
+    descriptorView[1] = primitiveCount;
+    const vbufId = aabbBuffer.id;
+    for (let i = 0; i < primitiveCount; i++) {
+      const base = 2 + i * GeometryDescriptorField.Count;
+      descriptorView[base + GeometryDescriptorField.Type] = GEOMETRY_TYPE_AABB;
+      descriptorView[base + GeometryDescriptorField.NumPrimitives] = 1;
+      descriptorView[base + GeometryDescriptorField.VbufId] = vbufId;
+      descriptorView[base + GeometryDescriptorField.VbufByteOffset] = i * BYTES_PER_AABB;
+      descriptorView[base + GeometryDescriptorField.IbufId] = -1;
+      descriptorView[base + GeometryDescriptorField.IbufByteOffset] = 0;
+    }
+
+    const built = wasmModule.build_blas(descriptorBuffer.id);
+    const nodeBuffer = built.serialized;
+    const nodeView = nodeBuffer.u8_view() as Uint8Array;
+    const nodeDataCopy = new Uint8Array(nodeView.length);
+    nodeDataCopy.set(nodeView);
+    const nodeCount = built.num_nodes >>> 0;
+    nodeBuffer.free();
+    built.free();
+    return { nodeCount, nodeData: nodeDataCopy };
+  } catch (error) {
+    if (!warnedMissingAabbBuilder) {
+      warnedMissingAabbBuilder = true;
+    }
+    debugWarn('[WebRTX] Failed to build BVH for fallback renderer; falling back to linear traversal', error);
+    return { nodeCount: 0, nodeData: new Uint8Array(0) };
+  } finally {
+    descriptorBuffer?.free();
+    aabbBuffer?.free();
+  }
 }
 
 function patchStagingBuffer(_wasm: BvhWasmModule) {

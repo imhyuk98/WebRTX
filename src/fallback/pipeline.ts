@@ -289,6 +289,34 @@ function toUint32ArrayView(source: ArrayBufferLike | ArrayBufferView | ArrayLike
 	throw new Error('Unsupported index data source');
 }
 
+function validatePrimitiveRefTypes(refs: Uint32Array, counts: PrimitiveCounts): void {
+	let slot = 0;
+	const check = (count: number, expectedType: number, label: string) => {
+		for (let i = 0; i < count; i++, slot++) {
+			const base = slot * PRIMITIVE_REF_UINTS;
+			if (base >= refs.length) {
+				throw new Error(`[WebRTX] PrimitiveRef buffer too small when validating ${label}`);
+			}
+			const actualType = refs[base];
+			if (actualType !== expectedType) {
+				throw new Error(`[WebRTX] PrimitiveRef type mismatch for ${label} at slot ${slot}: expected ${expectedType}, got ${actualType}`);
+			}
+		}
+	};
+	check(counts.sphere, PRIM_TYPE_SPHERE, 'sphere');
+	check(counts.cylinder, PRIM_TYPE_CYLINDER, 'cylinder');
+	check(counts.circle, PRIM_TYPE_CIRCLE, 'circle');
+	check(counts.ellipse, PRIM_TYPE_ELLIPSE, 'ellipse');
+	check(counts.cone, PRIM_TYPE_CONE, 'cone');
+	check(counts.line, PRIM_TYPE_LINE, 'line');
+	check(counts.torus, PRIM_TYPE_TORUS, 'torus');
+	check(counts.plane, PRIM_TYPE_PLANE, 'plane');
+	check(counts.bezier, PRIM_TYPE_BEZIER_PATCH, 'bezier');
+	if (slot * PRIMITIVE_REF_UINTS > refs.length) {
+		throw new Error('[WebRTX] PrimitiveRef validation scanned past buffer length');
+	}
+}
+
 function convertWebRtxBlasNodesToFallback(rawNodeBytes: Uint8Array, nodeCount: number, primitiveCount: number): ConvertedWebRtxBlas {
 	if (nodeCount <= 0) {
 		throw new Error('WebRTX BVH provided no nodes');
@@ -365,17 +393,21 @@ function convertWebRtxBlasNodesToFallback(rawNodeBytes: Uint8Array, nodeCount: n
 		fallbackF32[floatBase + 5] = node.max[1];
 		fallbackF32[floatBase + 6] = node.max[2];
 		fallbackF32[floatBase + 7] = 0.0;
-		const entryIndex = node.entry >>> 0;
-		const exitIndex = node.exit >>> 0;
-		if (node.geometryId >= 0) {
-			const primitiveIndex = entryIndex;
-			if (primitiveIndex >= primitiveCount) {
-				throw new Error('WebRTX BVH primitive index out of range');
-			}
-			fallbackU32[floatBase + 8] = SENTINEL;
-			fallbackU32[floatBase + 9] = toValidIndex(exitIndex);
-			fallbackU32[floatBase + 10] = primitiveIndex;
-			fallbackU32[floatBase + 11] = 1;
+			const entryIndex = node.entry >>> 0;
+			const exitIndex = node.exit >>> 0;
+			if (node.geometryId >= 0) {
+				let primitiveIndex = entryIndex;
+				const geometryIndex = node.geometryId >>> 0;
+				if (geometryIndex < primitiveCount) {
+					primitiveIndex = geometryIndex;
+				}
+				if (primitiveIndex >= primitiveCount) {
+					throw new Error('WebRTX BVH primitive index out of range');
+				}
+				fallbackU32[floatBase + 8] = SENTINEL;
+				fallbackU32[floatBase + 9] = toValidIndex(exitIndex);
+				fallbackU32[floatBase + 10] = primitiveIndex;
+				fallbackU32[floatBase + 11] = 1;
 		} else {
 			fallbackU32[floatBase + 8] = toValidIndex(entryIndex);
 			fallbackU32[floatBase + 9] = toValidIndex(exitIndex);
@@ -1385,6 +1417,8 @@ export async function runFallbackPipeline(options: FallbackPipelineOptions): Pro
 			indices = indices.slice(0, cursor);
 			primitiveCount = cursor;
 		}
+
+		validatePrimitiveRefTypes(primitiveRefs, counts);
 
 		if (isWebrtxDebugLoggingEnabled() && !debugPrimitiveSnapshotLogged) {
 			debugPrimitiveSnapshotLogged = true;
