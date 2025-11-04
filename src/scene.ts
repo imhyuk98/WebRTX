@@ -4,6 +4,7 @@ import { initBvhWasm } from './wasm_bvh_builder';
 import { buildAnalyticPrimitivesTLAS } from './analytic_primitives_bvh';
 import { getRayGenShader, getMissShader, getIntersectionShader, getClosestHitShader } from './analytic_shaders';
 import { runFallbackPipeline } from './fallback/pipeline';
+import { BEZIER_FLOATS, convertHermitePatchToBezier, packBezierPatchFloats } from './bezier_patch';
 import type {
   FallbackPipelineHandle,
 } from './fallback/pipeline';
@@ -26,6 +27,26 @@ const DEFAULT_WIDTH = 1920;
 const DEFAULT_HEIGHT = 1080;
 const DEFAULT_SPHERES_COUNT = 100;
 const LINE_RADIUS = 0.001;
+const DEFAULT_BEZIER_PATCHES: BezierPatchInstance[] = [{
+  p00: [0.6, -1.15, -2.6],
+  p10: [1.1, -1.05, -2.45],
+  p01: [0.65, -1.0, -2.1],
+  p11: [1.15, -0.95, -1.95],
+  du00: [0.35, 0.05, 0.18],
+  du10: [0.32, 0.05, 0.15],
+  du01: [0.38, 0.04, 0.16],
+  du11: [0.34, 0.04, 0.14],
+  dv00: [0.04, 0.18, 0.42],
+  dv10: [-0.03, 0.18, 0.38],
+  dv01: [0.05, 0.16, 0.36],
+  dv11: [-0.02, 0.16, 0.33],
+  duv00: [0.02, -0.03, -0.04],
+  duv10: [-0.015, -0.03, -0.035],
+  duv01: [0.025, -0.025, -0.04],
+  duv11: [-0.02, -0.025, -0.035],
+  maxDepth: 5,
+  pixelEpsilon: 1.5,
+}];
 
 interface MinimalSceneConfig {
   sphereCenter: Vec3;
@@ -63,9 +84,30 @@ interface MinimalSceneConfig {
   planeYDir: Vec3;
   planeHalfWidth: number;
   planeHalfHeight: number;
+  bezierPatches?: BezierPatchInstance[];
 }
 
 const cloneVec3 = (v: Vec3): Vec3 => [v[0], v[1], v[2]];
+const cloneBezierPatch = (patch: BezierPatchInstance): BezierPatchInstance => ({
+  p00: cloneVec3(patch.p00),
+  p01: cloneVec3(patch.p01),
+  p10: cloneVec3(patch.p10),
+  p11: cloneVec3(patch.p11),
+  du00: cloneVec3(patch.du00),
+  du01: cloneVec3(patch.du01),
+  du10: cloneVec3(patch.du10),
+  du11: cloneVec3(patch.du11),
+  dv00: cloneVec3(patch.dv00),
+  dv01: cloneVec3(patch.dv01),
+  dv10: cloneVec3(patch.dv10),
+  dv11: cloneVec3(patch.dv11),
+  duv00: cloneVec3(patch.duv00),
+  duv01: cloneVec3(patch.duv01),
+  duv10: cloneVec3(patch.duv10),
+  duv11: cloneVec3(patch.duv11),
+  maxDepth: patch.maxDepth,
+  pixelEpsilon: patch.pixelEpsilon,
+});
 
 function normalizeVec3(v: Vec3): Vec3 {
   const len = Math.hypot(v[0], v[1], v[2]);
@@ -132,6 +174,7 @@ function buildMinimalSceneState(config: MinimalSceneConfig): MinimalSceneConfig 
     planeYDir: cloneVec3(config.planeYDir),
     planeHalfWidth: config.planeHalfWidth,
     planeHalfHeight: config.planeHalfHeight,
+    bezierPatches: config.bezierPatches ? config.bezierPatches.map(cloneBezierPatch) : [],
   };
 }
 
@@ -195,7 +238,9 @@ function buildFallbackSceneDescriptor(config: MinimalSceneConfig): FallbackScene
       halfWidth: config.planeHalfWidth,
       halfHeight: config.planeHalfHeight,
     }],
-    bezierPatches: [],
+    bezierPatches: config.bezierPatches && config.bezierPatches.length > 0
+      ? config.bezierPatches.map(cloneBezierPatch)
+      : [],
   };
 }
 
@@ -374,6 +419,7 @@ async function runMinimalSceneImpl(
     planeYDir,
     planeHalfWidth,
     planeHalfHeight,
+    bezierPatches: DEFAULT_BEZIER_PATCHES,
   });
   // Allow interactive options to override line as startPoint/endPoint with default thickness
   const __ovr = (globalThis as any).__webrtxOverrides || {};
@@ -729,24 +775,29 @@ async function runMinimalSceneImpl(
     planeHalfHeight,
     planes: [currPlane],
     lineP0: lp0, lineP1: lp1, lineRadius: LINE_RADIUS,
+    bezierPatches: fallbackSceneState.bezierPatches && fallbackSceneState.bezierPatches.length > 0
+      ? fallbackSceneState.bezierPatches.map(cloneBezierPatch)
+      : [],
   };
   // No default mass torus instances; user can call setTori([...]) to add many.
   const { tlas: tlas0, meta: meta0 } = await buildAnalyticPrimitivesTLAS(device, curr);
   let tlas = tlas0;
   // New: scene meta (gid bases/counts) UBO
-  const sceneMetaBuf = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const sceneMetaBuf = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   function writeMeta(m:any){
     // Pack ranges for all known primitives into SceneMeta uvec4s
     // m0: [torusBase, torusCount, ellipseBase, ellipseCount]
     // m1: [sphereBase, sphereCount, cylinderBase, cylinderCount]
     // m2: [circleBase, circleCount, planeBase, planeCount]
     // m3: [coneBase, coneCount, lineBase, lineCount]
+    // m4: [bezierBase, bezierCount, 0, 0]
     const d = new Uint32Array([
       m.torusBase ?? 0, m.torusCount ?? 0, m.ellipseBase ?? 0, m.ellipseCount ?? 0,
       m.sphereBase ?? 0, m.sphereCount ?? 1, m.cylinderBase ?? 1, m.cylinderCount ?? 1,
       m.circleBase ?? 0, m.circleCount ?? 0, m.planeBase ?? 0, m.planeCount ?? 0,
       m.coneBase ?? 0, m.coneCount ?? 0, m.lineBase ?? 0, m.lineCount ?? 0,
-    ]); // total 16 u32 = 64 bytes
+      m.bezierBase ?? 0, m.bezierCount ?? 0, 0, 0,
+    ]); // total 20 u32 = 80 bytes
     device.queue.writeBuffer(sceneMetaBuf, 0, d);
   }
   writeMeta(meta0 as any);
@@ -836,6 +887,31 @@ async function runMinimalSceneImpl(
     device.queue.writeBuffer(packedOffsetsBuf, 16, strideU32);
   }
   writePackedFromCurr();
+  let bezierArrayBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  let bezierArrayCapFloats = 4;
+  function writeBezierArrayFromCurr(){
+    const patches: BezierPatchInstance[] = ((curr as any).bezierPatches && (curr as any).bezierPatches.length>0)
+      ? (curr as any).bezierPatches
+      : [];
+    const count = patches.length;
+    const requiredFloats = count * BEZIER_FLOATS;
+    if (requiredFloats > bezierArrayCapFloats) {
+      bezierArrayCapFloats = Math.max(requiredFloats, BEZIER_FLOATS);
+      bezierArrayBuf = device.createBuffer({ size: bezierArrayCapFloats * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    }
+    if (count === 0) {
+      return;
+    }
+    const arr = new Float32Array(requiredFloats);
+    let cursor = 0;
+    for (let i = 0; i < count; i++) {
+      const converted = convertHermitePatchToBezier(patches[i]);
+      packBezierPatchFloats(converted, arr, cursor);
+      cursor += BEZIER_FLOATS;
+    }
+    device.queue.writeBuffer(bezierArrayBuf, 0, arr);
+  }
+  writeBezierArrayFromCurr();
   // Shader sources (moved to dedicated module)
   const rgen = getRayGenShader();
   const rmiss = getMissShader();
@@ -903,6 +979,7 @@ async function runMinimalSceneImpl(
       {binding:10, resource:{ buffer: torusArrayBuf }},
       {binding:11, resource:{ buffer: sphereArrayBuf }},
       {binding:12, resource:{ buffer: cylArrayBuf }},
+      {binding:14, resource:{ buffer: bezierArrayBuf }},
     ] }) as any;
     // Attach acceleration structure metadata for the polyfill pass encoder
     bg.__accel_container = tlas;
@@ -924,11 +1001,12 @@ async function runMinimalSceneImpl(
     writeTorusArrayFromCurr();
     writeSphereArrayFromCurr();
     writeCylinderArrayFromCurr();
-  writeCircleArrayFromCurr(); // still used for AABB packing helpers
-  writeEllipseArrayFromCurr();
-  writeLineArrayFromCurr();
-  writeConeArrayFromCurr();
-  writePackedFromCurr();
+    writeCircleArrayFromCurr(); // still used for AABB packing helpers
+    writeEllipseArrayFromCurr();
+    writeLineArrayFromCurr();
+    writeConeArrayFromCurr();
+    writePackedFromCurr();
+    writeBezierArrayFromCurr();
     // Recreate pipeline + SBT bound to the new TLAS and then rebind
     await recreatePipeline();
     userBG = createUserBG();
@@ -1155,6 +1233,13 @@ async function runMinimalSceneImpl(
     const safe = instances.map(co=>{ const x=norm(co.xdir); const y=ortho(x, norm(co.ydir)); return { center:co.center, xdir:x, ydir:y, radius:co.radius, height:co.height }; });
     (curr as any).cones = safe; await rebuildTLAS();
   }
+  async function setBezierPatches(instances: BezierPatchInstance[]){
+    (curr as any).bezierPatches = instances.map(cloneBezierPatch);
+    await rebuildTLAS();
+  }
+  async function setBezierPatch(instance: BezierPatchInstance){
+    await setBezierPatches([instance]);
+  }
   return {
     renderer: 'raytracing' as const,
     updateCamera,
@@ -1173,6 +1258,8 @@ async function runMinimalSceneImpl(
     setLines,
     setCones,
     setLine,
+    setBezierPatch,
+    setBezierPatches,
     setScene: async (scene: FallbackSceneDescriptor) => {
       curr = {
         sphereCenter: scene.spheres[0]?.center ?? curr.sphereCenter,
@@ -1257,7 +1344,7 @@ async function runMinimalSceneImpl(
         halfWidth: p.halfWidth,
         halfHeight: p.halfHeight,
       }));
-      (curr as any).bezierPatches = scene.bezierPatches.map((b) => ({ ...b }));
+      (curr as any).bezierPatches = scene.bezierPatches.map(cloneBezierPatch);
       await rebuildTLAS();
     },
     stop,
@@ -1340,6 +1427,7 @@ export async function runMinimalScene(
     planeYDir,
     planeHalfWidth,
     planeHalfHeight,
+    bezierPatches: DEFAULT_BEZIER_PATCHES,
   });
   try {
     return await runMinimalSceneImpl(
@@ -1477,6 +1565,7 @@ export async function runSharedScene(
     planeYDir: [0.0, 0.0, 1.0],
     planeHalfWidth: 10.0,
     planeHalfHeight: 10.0,
+    bezierPatches: DEFAULT_BEZIER_PATCHES,
   });
   const fallbackPromise = launchFallbackRenderer(canvasOrId, width, height, config).catch(() => null);
   const rtPromise = runMinimalSceneImpl(

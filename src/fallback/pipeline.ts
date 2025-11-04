@@ -76,6 +76,9 @@ export interface FallbackPipelineOptions {
 	adapter: GPUAdapter;
 	scene: FallbackSceneDescriptor;
 	device?: GPUDevice;
+	enableBezierDebugTelemetry?: boolean;
+	enableBezierUploads?: boolean;
+	bezierDebugLogThrottleMs?: number;
 }
 
 export interface FallbackPipelineHandle {
@@ -101,6 +104,8 @@ export interface FallbackPipelineHandle {
 	setBezierPatches(instances: BezierPatchInstance[]): Promise<void>;
 	setScene(scene: FallbackSceneDescriptor): Promise<void>;
 	stop(): void;
+	setBezierDebugTelemetryEnabled(enabled: boolean): void;
+	setBezierUploadsEnabled(enabled: boolean): Promise<void>;
 }
 
 const BVH_INVALID_INDEX = 0xffffffff;
@@ -124,6 +129,8 @@ const PRIM_TYPE_LINE = 5;
 const PRIM_TYPE_TORUS = 6;
 const PRIM_TYPE_PLANE = 7;
 const PRIM_TYPE_BEZIER_PATCH = 8;
+const DEBUG_COUNTER_STRIDE_UINTS = 12;
+const DEBUG_COUNTER_DEFAULT_LOG_THROTTLE_MS = 750;
 
 const asyncNoop = async () => {};
 
@@ -423,10 +430,20 @@ function convertWebRtxBlasNodesToFallback(rawNodeBytes: Uint8Array, nodeCount: n
 }
 
 export async function runFallbackPipeline(options: FallbackPipelineOptions): Promise<FallbackPipelineHandle> {
-	const { canvasOrId, width, height, adapter, scene } = options;
+	const {
+		canvasOrId,
+		width,
+		height,
+		adapter,
+		scene,
+		enableBezierDebugTelemetry = false,
+		enableBezierUploads = true,
+		bezierDebugLogThrottleMs,
+	} = options;
 	if (isWebrtxDebugLoggingEnabled()) {
 		debugInfo('[WebRTX] Fallback pipeline invoked', summarizeSceneDescriptor(scene));
 	}
+	const debugTelemetryLogThrottleMs = Math.max(0, bezierDebugLogThrottleMs ?? DEBUG_COUNTER_DEFAULT_LOG_THROTTLE_MS);
 	const cloneVec3 = (v: Vec3): Vec3 => [v[0], v[1], v[2]];
 	const cloneBezierPatch = (patch: BezierPatchInstance): BezierPatchInstance => ({
 		p00: cloneVec3(patch.p00),
@@ -597,6 +614,13 @@ export async function runFallbackPipeline(options: FallbackPipelineOptions): Pro
 	let outputTextureView: GPUTextureView | null = null;
 	const OUTPUT_TEXTURE_FORMAT = 'rgba8unorm';
 	let cameraDebugLogged = false;
+	let bezierDebugTelemetryEnabled = enableBezierDebugTelemetry;
+	let bezierUploadsEnabled = enableBezierUploads;
+	const debugCounterStorage = { buffer: null as GPUBuffer | null, size: 0 };
+	const debugCounterReadback = { buffer: null as GPUBuffer | null, size: 0 };
+	let debugCounterGroupCount = 1;
+	let pendingDebugReadback: Promise<void> | null = null;
+	let lastDebugLogTime = 0;
 
 	function isZeroVec(v: Vec3): boolean {
 		return Math.abs(v[0]) < 1e-5 && Math.abs(v[1]) < 1e-5 && Math.abs(v[2]) < 1e-5;
@@ -768,9 +792,121 @@ export async function runFallbackPipeline(options: FallbackPipelineOptions): Pro
 		cameraUniformData[27] = currentPrimitiveCounts.plane;
 		cameraUniformData[28] = currentPrimitiveCounts.bezier;
 		cameraUniformData[29] = currentBezierPatchCount;
-		cameraUniformData[30] = 0;
-		cameraUniformData[31] = 0;
+		cameraUniformData[30] = bezierDebugTelemetryEnabled ? 1 : 0;
+		cameraUniformData[31] = bezierUploadsEnabled ? 1 : 0;
 		device.queue.writeBuffer(cameraUniformBuffer, 0, cameraUniformData);
+	}
+
+	function getDispatchGroupCount(): number {
+		const groupsX = Math.max(1, Math.ceil(internalWidth / WORKGROUP_SIZE_X));
+		const groupsY = Math.max(1, Math.ceil(internalHeight / WORKGROUP_SIZE_Y));
+		return groupsX * groupsY;
+	}
+
+	function ensureDebugCounterBuffer(groupCount: number): void {
+		const requiredGroups = Math.max(1, groupCount);
+		const requiredUints = requiredGroups * DEBUG_COUNTER_STRIDE_UINTS;
+		const requiredBytes = alignTo(requiredUints * Uint32Array.BYTES_PER_ELEMENT, 16);
+		if (!debugCounterStorage.buffer || debugCounterStorage.size < requiredBytes) {
+			debugCounterStorage.buffer?.destroy();
+			debugCounterStorage.buffer = device.createBuffer({
+				size: requiredBytes,
+				usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+			});
+			debugCounterStorage.size = requiredBytes;
+		}
+		if (!debugCounterReadback.buffer || debugCounterReadback.size < requiredBytes) {
+			debugCounterReadback.buffer?.destroy();
+			debugCounterReadback.buffer = device.createBuffer({
+				size: requiredBytes,
+				usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+			});
+			debugCounterReadback.size = requiredBytes;
+		}
+		debugCounterGroupCount = requiredGroups;
+	}
+
+	function summarizeDebugCounters(data: Uint32Array, groupCount: number) {
+		const stride = DEBUG_COUNTER_STRIDE_UINTS;
+		const availableGroups = Math.min(groupCount, Math.floor(data.length / stride));
+		const totals = {
+			groups: availableGroups,
+			rayCount: 0,
+			nodesTraversed: 0,
+			leafTests: 0,
+			primitiveTests: 0,
+			bezierCandidateLeaves: 0,
+			bezierNewtonIterations: 0,
+			bezierHits: 0,
+			bezierMisses: 0,
+			bezierQueueOverflows: 0,
+			bezierMaxQueue: 0,
+			reservedCounter0: 0,
+			reservedCounter1: 0,
+		};
+		for (let group = 0; group < availableGroups; group++) {
+			const base = group * stride;
+			totals.rayCount += data[base + 0];
+			totals.nodesTraversed += data[base + 1];
+			totals.leafTests += data[base + 2];
+			totals.primitiveTests += data[base + 3];
+			totals.bezierCandidateLeaves += data[base + 4];
+			totals.bezierNewtonIterations += data[base + 5];
+			totals.bezierHits += data[base + 6];
+			totals.bezierMisses += data[base + 7];
+			totals.bezierQueueOverflows += data[base + 8];
+			const queueDepth = data[base + 9];
+			if (queueDepth > totals.bezierMaxQueue) {
+				totals.bezierMaxQueue = queueDepth;
+			}
+			totals.reservedCounter0 += data[base + 10];
+			totals.reservedCounter1 += data[base + 11];
+		}
+		return totals;
+	}
+
+	function scheduleDebugReadback(groupCount: number, byteLength: number): void {
+		if (!bezierDebugTelemetryEnabled) {
+			return;
+		}
+		if (!isWebrtxDebugLoggingEnabled()) {
+			return;
+		}
+		const buffer = debugCounterReadback.buffer;
+		if (!buffer || debugCounterReadback.size < byteLength || byteLength <= 0) {
+			return;
+		}
+		if (pendingDebugReadback) {
+			return;
+		}
+		const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+		if (now - lastDebugLogTime < debugTelemetryLogThrottleMs) {
+			return;
+		}
+		lastDebugLogTime = now;
+		pendingDebugReadback = buffer.mapAsync(GPUMapMode.READ, 0, byteLength)
+			.then(() => {
+				const mapped = buffer.getMappedRange(0, byteLength);
+				const snapshot = new Uint8Array(byteLength);
+				snapshot.set(new Uint8Array(mapped));
+				buffer.unmap();
+				pendingDebugReadback = null;
+				if (!bezierDebugTelemetryEnabled || !isWebrtxDebugLoggingEnabled()) {
+					return;
+				}
+				const counters = new Uint32Array(snapshot.buffer);
+				const totals = summarizeDebugCounters(counters, groupCount);
+				const logTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
+				lastDebugLogTime = logTime;
+				debugInfo('[Fallback] Bezier debug totals', totals);
+			})
+			.catch((error: unknown) => {
+				if (buffer.mapState === 'mapped') {
+					buffer.unmap();
+				}
+				pendingDebugReadback = null;
+				debugWarn('[Fallback] Failed to read Bezier debug counters', error);
+			});
 	}
 
 	function updateCameraOrientation(pos: Vec3, look: Vec3, up: Vec3): void {
@@ -962,7 +1098,8 @@ export async function runFallbackPipeline(options: FallbackPipelineOptions): Pro
 		}
 	}
 
-	async function buildPrimitiveAcceleration(prims: ScenePrimitiveState): Promise<PrimitiveAccelerationData> {
+	async function buildPrimitiveAcceleration(prims: ScenePrimitiveState, includeBezier: boolean): Promise<PrimitiveAccelerationData> {
+		const bezierSource = includeBezier ? prims.bezierPatches : [];
 		const counts: PrimitiveCounts = {
 			sphere: clampCountForFloatStorage('spheres', prims.spheres.length, SPHERE_FLOATS),
 			cylinder: clampCountForFloatStorage('cylinders', prims.cylinders.length, ANALYTIC_FLOATS),
@@ -972,7 +1109,7 @@ export async function runFallbackPipeline(options: FallbackPipelineOptions): Pro
 			line: clampCountForFloatStorage('lines', prims.lines.length, ANALYTIC_FLOATS),
 			torus: clampCountForFloatStorage('tori', prims.tori.length, ANALYTIC_FLOATS),
 			plane: clampCountForFloatStorage('planes', prims.planes.length, ANALYTIC_FLOATS),
-			bezier: clampCountForFloatStorage('bezier patches', prims.bezierPatches.length, BEZIER_FLOATS),
+			bezier: includeBezier ? clampCountForFloatStorage('bezier patches', bezierSource.length, BEZIER_FLOATS) : 0,
 		};
 
 		const analyticReduceOrder: Array<keyof PrimitiveCounts> = ['plane', 'torus', 'line', 'cone', 'ellipse', 'circle', 'cylinder'];
@@ -1066,7 +1203,7 @@ export async function runFallbackPipeline(options: FallbackPipelineOptions): Pro
 		const lines = prims.lines.slice(0, counts.line);
 		const tori = prims.tori.slice(0, counts.torus);
 		const planes = prims.planes.slice(0, counts.plane);
-		const bezierPatches = prims.bezierPatches.slice(0, counts.bezier);
+		const bezierPatches = bezierSource.slice(0, counts.bezier);
 
 		let aabbData = new Float32Array(Math.max(primitiveCount * 6, 0));
 		let primitiveRefs = new Uint32Array(Math.max(primitiveCount * PRIMITIVE_REF_UINTS, 0));
@@ -1492,7 +1629,7 @@ export async function runFallbackPipeline(options: FallbackPipelineOptions): Pro
 	}
 
 	async function updateAllPrimitives(prims: ScenePrimitiveState): Promise<void> {
-		const accel = await buildPrimitiveAcceleration(prims);
+		const accel = await buildPrimitiveAcceleration(prims, bezierUploadsEnabled);
 		primitiveCountValue = accel.primitiveCount;
 		primitiveIndexCountValue = accel.indices.length;
 		primitiveBvhNodeCountValue = accel.nodeCount;
@@ -1519,7 +1656,9 @@ export async function runFallbackPipeline(options: FallbackPipelineOptions): Pro
 
 		writeFloatStorageBuffer(sphereStorage, accel.sphereData, zeroSphereWrite);
 		writeFloatStorageBuffer(analyticStorage, accel.analyticData, zeroAnalyticWrite);
-		writeFloatStorageBuffer(bezierStorage, accel.bezierData, zeroBezierWrite);
+		if (bezierUploadsEnabled) {
+			writeFloatStorageBuffer(bezierStorage, accel.bezierData, zeroBezierWrite);
+		}
 		writeUintStorageBuffer(primitiveRefStorage, accel.primitiveRefs, zeroPrimitiveRefWrite);
 		writeUintStorageBuffer(primitiveIndexStorage, accel.indices, zeroIndexWrite);
 		writeBvhStorageBuffer(primitiveBvhStorage, accel.nodeBytes);
@@ -1540,6 +1679,7 @@ export async function runFallbackPipeline(options: FallbackPipelineOptions): Pro
 		ensureUintStorageBuffer(primitiveRefStorage, PRIMITIVE_REF_UINTS, Math.max(primitiveCountValue, 1));
 		ensureUintStorageBuffer(primitiveIndexStorage, 1, Math.max(primitiveIndexCountValue, 1));
 		ensureBvhStorageBuffer(primitiveBvhStorage, primitiveBvhNodeCountValue);
+		ensureDebugCounterBuffer(getDispatchGroupCount());
 
 		if (!sphereStorage.buffer ||
 			!primitiveBvhStorage.buffer ||
@@ -1547,6 +1687,7 @@ export async function runFallbackPipeline(options: FallbackPipelineOptions): Pro
 			!primitiveRefStorage.buffer ||
 			!analyticStorage.buffer ||
 			!bezierStorage.buffer ||
+			!debugCounterStorage.buffer ||
 			!outputTextureView) {
 			return;
 		}
@@ -1562,6 +1703,7 @@ export async function runFallbackPipeline(options: FallbackPipelineOptions): Pro
 				{ binding: 5, resource: { buffer: primitiveRefStorage.buffer } },
 				{ binding: 6, resource: { buffer: analyticStorage.buffer } },
 				{ binding: 7, resource: { buffer: bezierStorage.buffer } },
+				{ binding: 8, resource: { buffer: debugCounterStorage.buffer } },
 			],
 		});
 	}
@@ -1667,12 +1809,29 @@ export async function runFallbackPipeline(options: FallbackPipelineOptions): Pro
 			if (dispatchX <= 0 || dispatchY <= 0) {
 				return;
 			}
+			const groupCount = Math.max(dispatchX * dispatchY, 1);
 			const encoder = device.createCommandEncoder();
 			const computePass = encoder.beginComputePass();
 			computePass.setPipeline(computePipeline);
 			computePass.setBindGroup(0, computeBindGroup);
 			computePass.dispatchWorkgroups(dispatchX, dispatchY);
 			computePass.end();
+			let debugCopySize = 0;
+			if (bezierDebugTelemetryEnabled && debugCounterStorage.buffer && debugCounterReadback.buffer) {
+				const effectiveGroups = Math.max(1, Math.min(debugCounterGroupCount, groupCount));
+				const candidateBytes = effectiveGroups * DEBUG_COUNTER_STRIDE_UINTS * Uint32Array.BYTES_PER_ELEMENT;
+				const byteLength = Math.min(debugCounterStorage.size, Math.min(debugCounterReadback.size, candidateBytes));
+				if (byteLength > 0) {
+					encoder.copyBufferToBuffer(
+						debugCounterStorage.buffer,
+						0,
+						debugCounterReadback.buffer,
+						0,
+						byteLength,
+					);
+					debugCopySize = byteLength;
+				}
+			}
 			const textureView = gpuContext.getCurrentTexture().createView();
 			const pass = encoder.beginRenderPass({
 				colorAttachments: [{
@@ -1687,6 +1846,9 @@ export async function runFallbackPipeline(options: FallbackPipelineOptions): Pro
 			pass.draw(3, 1, 0, 0);
 			pass.end();
 			device.queue.submit([encoder.finish()]);
+			if (debugCopySize > 0) {
+				scheduleDebugReadback(groupCount, debugCopySize);
+			}
 		},
 		device,
 		setCameraFovY: (deg: number) => {
@@ -1760,8 +1922,38 @@ export async function runFallbackPipeline(options: FallbackPipelineOptions): Pro
 			currentScenePrimitives = cloneSceneToState(desc);
 			await updateAllPrimitives(currentScenePrimitives);
 		},
+		setBezierDebugTelemetryEnabled: (enabled: boolean) => {
+			const next = !!enabled;
+			if (bezierDebugTelemetryEnabled === next) {
+				return;
+			}
+			bezierDebugTelemetryEnabled = next;
+			if (next) {
+				ensureDebugCounterBuffer(getDispatchGroupCount());
+				rebuildComputeBindGroup();
+			} else if (debugCounterReadback.buffer?.mapState === 'mapped') {
+				debugCounterReadback.buffer.unmap();
+			}
+			pendingDebugReadback = null;
+			lastDebugLogTime = 0;
+			flushCameraUniform();
+		},
+		setBezierUploadsEnabled: async (enabled: boolean) => {
+			const next = !!enabled;
+			if (bezierUploadsEnabled === next) {
+				return;
+			}
+			bezierUploadsEnabled = next;
+			flushCameraUniform();
+			await updateAllPrimitives(currentScenePrimitives);
+		},
 		stop: () => {
 			stopped = true;
+			bezierDebugTelemetryEnabled = false;
+			if (debugCounterReadback.buffer?.mapState === 'mapped') {
+				debugCounterReadback.buffer.unmap();
+			}
+			pendingDebugReadback = null;
 			disposeFpsOverlay(fpsOverlay);
 		},
 	};

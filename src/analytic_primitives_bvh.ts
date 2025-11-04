@@ -1,4 +1,6 @@
 import { initBvhWasm } from './wasm_bvh_builder';
+import { convertHermitePatchToBezier } from './bezier_patch';
+import type { BezierPatchInstance } from './fallback/scene_descriptor';
 
 export interface AnalyticPrimitiveParams {
   sphereCenter: [number,number,number];
@@ -53,6 +55,7 @@ export interface AnalyticPrimitiveParams {
   lineP0?: [number,number,number]; // startPoint
   lineP1?: [number,number,number]; // endPoint
   lineRadius?: number; // thickness as radius
+  bezierPatches?: BezierPatchInstance[];
 }
 
 function normalize(v: [number,number,number]): [number,number,number] {
@@ -202,6 +205,14 @@ export async function buildAnalyticPrimitivesTLAS(device: GPUDevice, p: Analytic
     const tmax:[number,number,number] = [ t.center[0]+ext[0]+pad, t.center[1]+ext[1]+pad, t.center[2]+ext[2]+pad ];
     offTorusList.push(packAabb(packed, tmin, tmax));
   }
+  // Bezier patch bounds
+  const bezierPatches = spheresOnly ? [] : (p.bezierPatches ?? []);
+  const offBezier: number[] = [];
+  for (const patch of bezierPatches) {
+    const converted = convertHermitePatchToBezier(patch);
+    offBezier.push(packAabb(packed, converted.boundsMin, converted.boundsMax));
+  }
+
   const aabbPackData = new Float32Array(packed);
   const aabbPackBuf = device.createBuffer({ size: aabbPackData.byteLength, usage: (GPUBufferUsageRTX as any).ACCELERATION_STRUCTURE_BUILD_INPUT_READONLY, mappedAtCreation: true });
   new Float32Array(aabbPackBuf.getMappedRange()).set(aabbPackData); aabbPackBuf.unmap();
@@ -216,6 +227,7 @@ export async function buildAnalyticPrimitivesTLAS(device: GPUDevice, p: Analytic
   const gidEllipseBase = gid; gid += offEllipses.length;
   const gidLineBase = gid; gid += offLines.length;
   const gidTorusBase = gid; gid += offTorusList.length;
+  const gidBezierBase = gid; gid += offBezier.length;
 
   const bottom: GPURayTracingAccelerationContainerDescriptor_bottom = {
     usage: (GPURayTracingAccelerationContainerUsage as any).NONE,
@@ -229,6 +241,7 @@ export async function buildAnalyticPrimitivesTLAS(device: GPUDevice, p: Analytic
   ...offEllipses.map(off => ({ usage: (GPURayTracingAccelerationGeometryUsage as any).NONE, type:'aabbs' as const, aabb:{ buffer: aabbPackBuf, offset: off, format:'float32x2' as const, stride:12, size:24 } })),
   ...offLines.map(off => ({ usage: (GPURayTracingAccelerationGeometryUsage as any).NONE, type:'aabbs' as const, aabb:{ buffer: aabbPackBuf, offset: off, format:'float32x2' as const, stride:12, size:24 } })),
   ...offTorusList.map(off => ({ usage: (GPURayTracingAccelerationGeometryUsage as any).NONE, type:'aabbs' as const, aabb:{ buffer: aabbPackBuf, offset: off, format:'float32x2' as const, stride:12, size:24 } })),
+  ...offBezier.map(off => ({ usage: (GPURayTracingAccelerationGeometryUsage as any).NONE, type:'aabbs' as const, aabb:{ buffer: aabbPackBuf, offset: off, format:'float32x2' as const, stride:12, size:24 } })),
     ]
   };
   const top: GPURayTracingAccelerationContainerDescriptor_top = {
@@ -247,6 +260,7 @@ export async function buildAnalyticPrimitivesTLAS(device: GPUDevice, p: Analytic
     ellipseBase: gidEllipseBase, ellipseCount: offEllipses.length,
     lineBase: gidLineBase, lineCount: offLines.length,
     torusBase: gidTorusBase, torusCount: offTorusList.length,
+    bezierBase: gidBezierBase, bezierCount: offBezier.length,
   } as const;
   return { tlas, meta };
 }

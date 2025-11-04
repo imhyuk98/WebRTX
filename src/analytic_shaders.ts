@@ -1,4 +1,4 @@
-export function getRayGenShader(){return `#version 460 core\n#extension GL_EXT_ray_tracing : require\n#ifndef WEBRTX_DECL_RT_OUT\n#define WEBRTX_DECL_RT_OUT\nlayout(set=0,binding=0,std430) buffer RtOut { vec4 data[]; } rtOut;\n#endif\n#ifndef WEBRTX_DECL_CAM\n#define WEBRTX_DECL_CAM\nlayout(set=0,binding=1) uniform Cam { vec4 c0; vec4 c1; vec4 c2; vec4 c3; } cam;\n#endif\n#ifndef WEBRTX_DECL_META\n#define WEBRTX_DECL_META\nlayout(set=0,binding=2) uniform SceneMeta { uvec4 m0; uvec4 m1; uvec4 m2; uvec4 m3; } meta;\n#endif\nvoid main(){ uvec2 pix=gl_LaunchIDEXT.xy; uvec2 dim=gl_LaunchSizeEXT.xy; vec2 uv=(vec2(pix)+0.5)/vec2(dim); vec2 ndc=vec2(uv.x*2.0-1.0,1.0-uv.y*2.0); float aspect=float(dim.x)/float(dim.y); vec3 pos=cam.c0.xyz; vec3 look=cam.c1.xyz; vec3 up=normalize(cam.c2.xyz); vec3 f=normalize(look-pos); vec3 r=normalize(cross(f,up)); vec3 u=normalize(cross(r,f)); float fovY=cam.c3.x; float tanH=tan(fovY*0.5); vec3 rd=normalize(f + ndc.x*aspect*tanH*r + ndc.y*tanH*u); traceRayEXT(uvec2(0,0),0,0xff,0,2,0,pos,0.001,rd,1e38,0); }`;}
+export function getRayGenShader(){return `#version 460 core\n#extension GL_EXT_ray_tracing : require\n#ifndef WEBRTX_DECL_RT_OUT\n#define WEBRTX_DECL_RT_OUT\nlayout(set=0,binding=0,std430) buffer RtOut { vec4 data[]; } rtOut;\n#endif\n#ifndef WEBRTX_DECL_CAM\n#define WEBRTX_DECL_CAM\nlayout(set=0,binding=1) uniform Cam { vec4 c0; vec4 c1; vec4 c2; vec4 c3; } cam;\n#endif\n#ifndef WEBRTX_DECL_META\n#define WEBRTX_DECL_META\nlayout(set=0,binding=2) uniform SceneMeta { uvec4 m0; uvec4 m1; uvec4 m2; uvec4 m3; uvec4 m4; } meta;\n#endif\nvoid main(){ uvec2 pix=gl_LaunchIDEXT.xy; uvec2 dim=gl_LaunchSizeEXT.xy; vec2 uv=(vec2(pix)+0.5)/vec2(dim); vec2 ndc=vec2(uv.x*2.0-1.0,1.0-uv.y*2.0); float aspect=float(dim.x)/float(dim.y); vec3 pos=cam.c0.xyz; vec3 look=cam.c1.xyz; vec3 up=normalize(cam.c2.xyz); vec3 f=normalize(look-pos); vec3 r=normalize(cross(f,up)); vec3 u=normalize(cross(r,f)); float fovY=cam.c3.x; float tanH=tan(fovY*0.5); vec3 rd=normalize(f + ndc.x*aspect*tanH*r + ndc.y*tanH*u); traceRayEXT(uvec2(0,0),0,0xff,0,2,0,pos,0.001,rd,1e38,0); }`;}
 export function getMissShader(){return `#version 460 core\n#extension GL_EXT_ray_tracing : require\n#ifndef WEBRTX_DECL_RT_OUT\n#define WEBRTX_DECL_RT_OUT\nlayout(set=0,binding=0,std430) buffer RtOut { vec4 data[]; } rtOut;\n#endif\nvoid main(){ uvec2 pix=gl_LaunchIDEXT.xy; uvec2 dim=gl_LaunchSizeEXT.xy; vec2 uv=(vec2(pix)+0.5)/vec2(dim); vec3 col=mix(vec3(0.2,0.3,0.5),vec3(0.6,0.8,1.0),uv.y); rtOut.data[pix.y*dim.x+pix.x]=vec4(col,1.0); }`;}
 export function getIntersectionShader(){return `#version 460 core
 #extension GL_EXT_ray_tracing : require
@@ -18,7 +18,7 @@ layout(set=0,binding=13,std430) buffer PackedPrims { vec4 data[]; } packed;
 #endif
 #ifndef WEBRTX_DECL_META
 #define WEBRTX_DECL_META
-layout(set=0,binding=2) uniform SceneMeta { uvec4 m0; uvec4 m1; uvec4 m2; uvec4 m3; } meta;
+layout(set=0,binding=2) uniform SceneMeta { uvec4 m0; uvec4 m1; uvec4 m2; uvec4 m3; uvec4 m4; } meta;
 #endif
 #ifndef WEBRTX_DECL_CYL_ARRAY
 #define WEBRTX_DECL_CYL_ARRAY
@@ -58,6 +58,368 @@ layout(set=0,binding=8) uniform Line { vec4 l0; vec4 l1; } uLine;
 #define WEBRTX_DECL_CONE
 layout(set=0,binding=6) uniform Cone { vec4 e0; vec4 e1; } uCone; // e0: center.xyz, radius; e1: axis.xyz, height
 #endif
+#ifndef WEBRTX_DECL_BEZIER_BUFFER
+#define WEBRTX_DECL_BEZIER_BUFFER
+layout(set=0,binding=14,std430) buffer BezierPatches { vec4 data[]; } sBezier;
+#endif
+hitAttributeEXT vec2 attrUv;
+
+const uint BEZIER_VEC4_PER_PATCH = 18u;
+const int BEZIER_MAX_QUEUE = 48;
+
+struct BezierPatchData {
+  vec4 cp[16];
+  vec3 boundsMin;
+  vec3 boundsMax;
+  float maxDepth;
+  float pixelEpsilon;
+};
+
+struct BezierNode {
+  vec4 cp[16];
+  vec3 boundsMin;
+  vec3 boundsMax;
+  float u0;
+  float v0;
+  float u1;
+  float v1;
+  float tEnter;
+  int depth;
+};
+
+vec3 makeSafeInverse(vec3 dir){
+  const float EPS = 1e-6;
+  vec3 safe = vec3(
+    abs(dir.x) > EPS ? dir.x : (dir.x >= 0.0 ? EPS : -EPS),
+    abs(dir.y) > EPS ? dir.y : (dir.y >= 0.0 ? EPS : -EPS),
+    abs(dir.z) > EPS ? dir.z : (dir.z >= 0.0 ? EPS : -EPS)
+  );
+  return 1.0 / safe;
+}
+
+bool intersectAabbExt(vec3 bmin, vec3 bmax, vec3 origin, vec3 invDir, float tMin, float tMax, out float tEnter, out float tExit){
+  vec3 t0 = (bmin - origin) * invDir;
+  vec3 t1 = (bmax - origin) * invDir;
+  vec3 tmin = min(t0, t1);
+  vec3 tmax = max(t0, t1);
+  tEnter = max(max(max(tmin.x, tmin.y), tmin.z), tMin);
+  tExit = min(min(min(tmax.x, tmax.y), tmax.z), tMax);
+  return tExit >= tEnter;
+}
+
+int bezierIdx(int u, int v){
+  return u * 4 + v;
+}
+
+vec3 bezierGet(in vec4 cp[16], int u, int v){
+  return cp[bezierIdx(u, v)].xyz;
+}
+
+void bezierSet(inout vec4 cp[16], int u, int v, vec3 value){
+  cp[bezierIdx(u, v)] = vec4(value, 0.0);
+}
+
+BezierPatchData loadBezierPatch(uint index){
+  uint base = index * BEZIER_VEC4_PER_PATCH;
+  BezierPatchData result;
+  for(uint i=0u;i<16u;++i){
+    result.cp[i] = sBezier.data[base + i];
+  }
+  vec4 bounds0 = sBezier.data[base + 16u];
+  vec4 bounds1 = sBezier.data[base + 17u];
+  result.boundsMin = bounds0.xyz;
+  result.boundsMax = bounds1.xyz;
+  result.maxDepth = bounds0.w;
+  result.pixelEpsilon = bounds1.w;
+  return result;
+}
+
+void bezierEval(in vec4 cp[16], float u, float v, out vec3 P, out vec3 dPu, out vec3 dPv){
+  vec3 Cv[4];
+  for(int i=0;i<4;++i){
+    vec3 p0 = bezierGet(cp, i, 0);
+    vec3 p1 = bezierGet(cp, i, 1);
+    vec3 p2 = bezierGet(cp, i, 2);
+    vec3 p3 = bezierGet(cp, i, 3);
+    vec3 a = mix(p0, p1, v);
+    vec3 b = mix(p1, p2, v);
+    vec3 c = mix(p2, p3, v);
+    vec3 d = mix(a, b, v);
+    vec3 e = mix(b, c, v);
+    Cv[i] = mix(d, e, v);
+  }
+  vec3 A = mix(Cv[0], Cv[1], u);
+  vec3 B = mix(Cv[1], Cv[2], u);
+  vec3 C = mix(Cv[2], Cv[3], u);
+  vec3 D = mix(A, B, u);
+  vec3 E = mix(B, C, u);
+  P = mix(D, E, u);
+  dPu = 3.0 * (E - D);
+
+  vec3 Ru[4];
+  for(int j=0;j<4;++j){
+    vec3 p0 = bezierGet(cp, 0, j);
+    vec3 p1 = bezierGet(cp, 1, j);
+    vec3 p2 = bezierGet(cp, 2, j);
+    vec3 p3 = bezierGet(cp, 3, j);
+    vec3 a = mix(p0, p1, u);
+    vec3 b = mix(p1, p2, u);
+    vec3 c = mix(p2, p3, u);
+    vec3 d = mix(a, b, u);
+    vec3 e = mix(b, c, u);
+    Ru[j] = mix(d, e, u);
+  }
+  vec3 A2 = mix(Ru[0], Ru[1], v);
+  vec3 B2 = mix(Ru[1], Ru[2], v);
+  vec3 C2 = mix(Ru[2], Ru[3], v);
+  vec3 D2 = mix(A2, B2, v);
+  vec3 E2 = mix(B2, C2, v);
+  dPv = 3.0 * (E2 - D2);
+}
+
+void splitAlongV(in vec4 input[16], out vec4 lo[16], out vec4 hi[16]){
+  for(int i=0;i<4;++i){
+    vec3 a = bezierGet(input, i, 0);
+    vec3 b = bezierGet(input, i, 1);
+    vec3 c = bezierGet(input, i, 2);
+    vec3 d = bezierGet(input, i, 3);
+    vec3 ab = mix(a, b, 0.5);
+    vec3 bc = mix(b, c, 0.5);
+    vec3 cd = mix(c, d, 0.5);
+    vec3 abc = mix(ab, bc, 0.5);
+    vec3 bcd = mix(bc, cd, 0.5);
+    vec3 abcd = mix(abc, bcd, 0.5);
+    bezierSet(lo, i, 0, a);
+    bezierSet(lo, i, 1, ab);
+    bezierSet(lo, i, 2, abc);
+    bezierSet(lo, i, 3, abcd);
+    bezierSet(hi, i, 0, abcd);
+    bezierSet(hi, i, 1, bcd);
+    bezierSet(hi, i, 2, cd);
+    bezierSet(hi, i, 3, d);
+  }
+}
+
+void subdivideBezierPatch(in vec4 src[16], out vec4 c0[16], out vec4 c1[16], out vec4 c2[16], out vec4 c3[16]){
+  vec4 left[16];
+  vec4 right[16];
+  for(int j=0;j<4;++j){
+    vec3 a = bezierGet(src, 0, j);
+    vec3 b = bezierGet(src, 1, j);
+    vec3 c = bezierGet(src, 2, j);
+    vec3 d = bezierGet(src, 3, j);
+    vec3 ab = mix(a, b, 0.5);
+    vec3 bc = mix(b, c, 0.5);
+    vec3 cd = mix(c, d, 0.5);
+    vec3 abc = mix(ab, bc, 0.5);
+    vec3 bcd = mix(bc, cd, 0.5);
+    vec3 abcd = mix(abc, bcd, 0.5);
+    bezierSet(left, 0, j, a);
+    bezierSet(left, 1, j, ab);
+    bezierSet(left, 2, j, abc);
+    bezierSet(left, 3, j, abcd);
+    bezierSet(right, 0, j, abcd);
+    bezierSet(right, 1, j, bcd);
+    bezierSet(right, 2, j, cd);
+    bezierSet(right, 3, j, d);
+  }
+  splitAlongV(left, c0, c2);
+  splitAlongV(right, c1, c3);
+}
+
+void computeBezierBounds(in vec4 cp[16], out vec3 bmin, out vec3 bmax){
+  bmin = cp[0].xyz;
+  bmax = cp[0].xyz;
+  for(int i=1;i<16;++i){
+    vec3 p = cp[i].xyz;
+    bmin = min(bmin, p);
+    bmax = max(bmax, p);
+  }
+}
+
+bool newtonRefine(in vec4 cp[16], vec3 rayOrigin, vec3 rayDir, float tMin, float tMax, inout float u, inout float v, inout float t){
+  const int MAX_IT = 8;
+  const float EPS_F = 1e-4;
+  const float EPS_P = 1e-5;
+  for(int iter=0; iter<MAX_IT; ++iter){
+    vec3 P;
+    vec3 dPu;
+    vec3 dPv;
+    bezierEval(cp, u, v, P, dPu, dPv);
+    vec3 F = P - (rayOrigin + rayDir * t);
+    float err = length(F);
+    if(err < EPS_F){
+      bool inside = u >= -0.01 && u <= 1.01 && v >= -0.01 && v <= 1.01 && t >= tMin && t <= tMax;
+      return inside;
+    }
+    vec3 c0 = dPu;
+    vec3 c1 = dPv;
+    vec3 c2 = -rayDir;
+    vec3 r0 = cross(c1, c2);
+    vec3 r1 = cross(c2, c0);
+    vec3 r2 = cross(c0, c1);
+    float det = dot(c0, r0);
+    if(abs(det) < 1e-10){
+      return false;
+    }
+    float invDet = -1.0 / det;
+    float du = dot(r0, F) * invDet;
+    float dv = dot(r1, F) * invDet;
+    float dt = dot(r2, F) * invDet;
+    u += du;
+    v += dv;
+    t += dt;
+    if(abs(du) < EPS_P && abs(dv) < EPS_P && abs(dt) < EPS_P){
+      vec3 P2;
+      vec3 tmpDu;
+      vec3 tmpDv;
+      bezierEval(cp, u, v, P2, tmpDu, tmpDv);
+      vec3 F2 = P2 - (rayOrigin + rayDir * t);
+      float err2 = length(F2);
+      bool inside = u >= -0.01 && u <= 1.01 && v >= -0.01 && v <= 1.01 && t >= tMin && t <= tMax;
+      if(inside && err2 < EPS_F){
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool intersectBezierPatch(vec3 rayOrigin, float rayTMin, vec3 rayDir, float rayTMax, BezierPatchData patch, float pixelWorldSlope, out float hitT, out vec2 hitUV){
+  vec3 invDir = makeSafeInverse(rayDir);
+  float enterT;
+  float exitT;
+  float farLimit = rayTMax;
+  if(!intersectAabbExt(patch.boundsMin, patch.boundsMax, rayOrigin, invDir, rayTMin, farLimit, enterT, exitT)){
+    return false;
+  }
+  float bestT = min(rayTMax, exitT);
+  vec2 bestUV = vec2(0.0);
+  float pixelEps = max(patch.pixelEpsilon, 1e-4);
+  int maxDepth = clamp(int(floor(patch.maxDepth + 0.5)), 1, 16);
+  vec3 rootExtents = patch.boundsMax - patch.boundsMin;
+  float rootMaxEdge = max(max(rootExtents.x, rootExtents.y), rootExtents.z);
+  bool hasHit = false;
+  float depthEdgeTarget = rootMaxEdge * exp2(-float(maxDepth));
+  float baseLeafEdge = max(pixelEps, depthEdgeTarget);
+  BezierNode queue[BEZIER_MAX_QUEUE];
+  int size = 0;
+  BezierNode root;
+  for(int i=0;i<16;++i){ root.cp[i] = patch.cp[i]; }
+  root.boundsMin = patch.boundsMin;
+  root.boundsMax = patch.boundsMax;
+  root.u0 = 0.0;
+  root.v0 = 0.0;
+  root.u1 = 1.0;
+  root.v1 = 1.0;
+  root.tEnter = enterT;
+  root.depth = 0;
+  queue[size++] = root;
+  while(size > 0){
+    int bestIdx = 0;
+    float bestEnter = queue[0].tEnter;
+    for(int i=1;i<size;++i){
+      if(queue[i].tEnter < bestEnter){
+        bestEnter = queue[i].tEnter;
+        bestIdx = i;
+      }
+    }
+    BezierNode node = queue[bestIdx];
+    queue[bestIdx] = queue[--size];
+    if(node.tEnter >= bestT){
+      continue;
+    }
+    vec3 extents = node.boundsMax - node.boundsMin;
+    float maxEdge = max(max(extents.x, extents.y), extents.z);
+    float distanceEstimate = max(max(node.tEnter, rayTMin), 0.0);
+    float screenLeafEdge = max(distanceEstimate * pixelWorldSlope, 1e-4);
+    float nodeLeafEdge = max(baseLeafEdge, screenLeafEdge);
+  bool leaf = (maxEdge <= nodeLeafEdge) || (node.depth >= maxDepth);
+    if(leaf){
+      float uLocal = 0.5;
+      float vLocal = 0.5;
+      float tCandidate = clamp(node.tEnter, rayTMin, bestT);
+      float tUpper = min(bestT, rayTMax);
+      if(newtonRefine(node.cp, rayOrigin, rayDir, rayTMin, tUpper, uLocal, vLocal, tCandidate)){
+        if(tCandidate >= rayTMin && tCandidate < bestT && tCandidate <= rayTMax){
+          float uGlobal = mix(node.u0, node.u1, clamp(uLocal, 0.0, 1.0));
+          float vGlobal = mix(node.v0, node.v1, clamp(vLocal, 0.0, 1.0));
+          bestT = tCandidate;
+          bestUV = vec2(uGlobal, vGlobal);
+          hasHit = true;
+        }
+      }
+      continue;
+    }
+    vec4 child0[16];
+    vec4 child1[16];
+    vec4 child2[16];
+    vec4 child3[16];
+    subdivideBezierPatch(node.cp, child0, child1, child2, child3);
+    float uMid = 0.5 * (node.u0 + node.u1);
+    float vMid = 0.5 * (node.v0 + node.v1);
+    float farBound = min(bestT, rayTMax);
+
+  vec3 bmin0; vec3 bmax0; computeBezierBounds(child0, bmin0, bmax0);
+  float enter0; float exit0;
+  if(size < BEZIER_MAX_QUEUE && intersectAabbExt(bmin0, bmax0, rayOrigin, invDir, rayTMin, farBound, enter0, exit0)){
+      BezierNode child;
+      for(int k=0;k<16;++k){ child.cp[k] = child0[k]; }
+      child.boundsMin = bmin0 - vec3(1e-6);
+      child.boundsMax = bmax0 + vec3(1e-6);
+      child.depth = node.depth + 1;
+      child.u0 = node.u0; child.u1 = uMid; child.v0 = node.v0; child.v1 = vMid;
+      child.tEnter = enter0;
+      queue[size++] = child;
+    }
+
+  vec3 bmin1; vec3 bmax1; computeBezierBounds(child1, bmin1, bmax1);
+  float enter1; float exit1;
+  if(size < BEZIER_MAX_QUEUE && intersectAabbExt(bmin1, bmax1, rayOrigin, invDir, rayTMin, farBound, enter1, exit1)){
+      BezierNode child;
+      for(int k=0;k<16;++k){ child.cp[k] = child1[k]; }
+      child.boundsMin = bmin1 - vec3(1e-6);
+      child.boundsMax = bmax1 + vec3(1e-6);
+      child.depth = node.depth + 1;
+      child.u0 = uMid; child.u1 = node.u1; child.v0 = node.v0; child.v1 = vMid;
+      child.tEnter = enter1;
+      queue[size++] = child;
+    }
+
+  vec3 bmin2; vec3 bmax2; computeBezierBounds(child2, bmin2, bmax2);
+  float enter2; float exit2;
+  if(size < BEZIER_MAX_QUEUE && intersectAabbExt(bmin2, bmax2, rayOrigin, invDir, rayTMin, farBound, enter2, exit2)){
+      BezierNode child;
+      for(int k=0;k<16;++k){ child.cp[k] = child2[k]; }
+      child.boundsMin = bmin2 - vec3(1e-6);
+      child.boundsMax = bmax2 + vec3(1e-6);
+      child.depth = node.depth + 1;
+      child.u0 = node.u0; child.u1 = uMid; child.v0 = vMid; child.v1 = node.v1;
+      child.tEnter = enter2;
+      queue[size++] = child;
+    }
+
+  vec3 bmin3; vec3 bmax3; computeBezierBounds(child3, bmin3, bmax3);
+  float enter3; float exit3;
+  if(size < BEZIER_MAX_QUEUE && intersectAabbExt(bmin3, bmax3, rayOrigin, invDir, rayTMin, farBound, enter3, exit3)){
+      BezierNode child;
+      for(int k=0;k<16;++k){ child.cp[k] = child3[k]; }
+      child.boundsMin = bmin3 - vec3(1e-6);
+      child.boundsMax = bmax3 + vec3(1e-6);
+      child.depth = node.depth + 1;
+      child.u0 = uMid; child.u1 = node.u1; child.v0 = vMid; child.v1 = node.v1;
+      child.tEnter = enter3;
+      queue[size++] = child;
+    }
+  }
+  if(hasHit && bestT < min(rayTMax, 1e37)){
+    hitT = bestT;
+    hitUV = bestUV;
+    return true;
+  }
+  return false;
+}
+
 void main(){
   // Use built-in ray state to avoid recomputing camera rays per intersection
   vec3 ro = gl_WorldRayOriginEXT;
@@ -157,6 +519,15 @@ void main(){
     vec3 p0=l0.xyz; vec3 p1=l1.xyz; float r=l0.w; vec3 n; float tHit;
     bool hit = intersect_line_segment(ro, nearT, rd, INF, p0, p1, r, tHit, n);
     if(hit && tHit>=nearT && tHit<INF) reportIntersectionEXT(tHit, gl_HitKindFrontFacingTriangleEXT);
+  } else if(gid >= meta.m4.x && gid < meta.m4.x + meta.m4.y){
+    uint patchIndex = gid - meta.m4.x;
+    BezierPatchData patch = loadBezierPatch(patchIndex);
+    float tHit;
+    vec2 uvHit;
+  if(intersectBezierPatch(ro, nearT, rd, INF, patch, 0.0, tHit, uvHit)){
+      attrUv = clamp(uvHit, vec2(0.0), vec2(1.0));
+      reportIntersectionEXT(tHit, gl_HitKindFrontFacingTriangleEXT);
+    }
   } else if(gid >= meta.m0.x && gid < meta.m0.x + meta.m0.y) {
     // torus array via SSBO: use SceneMeta.m0.x (base) and m0.y (count)
     uint i = gid - meta.m0.x;
@@ -188,7 +559,7 @@ layout(set=0,binding=1) uniform Cam { vec4 c0; vec4 c1; vec4 c2; vec4 c3; } cam;
 #endif
 #ifndef WEBRTX_DECL_META
 #define WEBRTX_DECL_META
-layout(set=0,binding=2) uniform SceneMeta { uvec4 m0; uvec4 m1; uvec4 m2; uvec4 m3; } meta;
+layout(set=0,binding=2) uniform SceneMeta { uvec4 m0; uvec4 m1; uvec4 m2; uvec4 m3; uvec4 m4; } meta;
 #endif
 #ifndef WEBRTX_DECL_CYL_ARRAY
 #define WEBRTX_DECL_CYL_ARRAY
@@ -226,6 +597,82 @@ layout(set=0,binding=8) uniform Line { vec4 l0; vec4 l1; } uLine;
 #define WEBRTX_DECL_CONE
 layout(set=0,binding=6) uniform Cone { vec4 e0; vec4 e1; } uCone;
 #endif
+#ifndef WEBRTX_DECL_BEZIER_BUFFER
+#define WEBRTX_DECL_BEZIER_BUFFER
+layout(set=0,binding=14,std430) buffer BezierPatches { vec4 data[]; } sBezier;
+#endif
+hitAttributeEXT vec2 attrUv;
+
+const uint BEZIER_VEC4_PER_PATCH = 18u;
+
+struct BezierPatchData {
+  vec4 cp[16];
+  vec3 boundsMin;
+  vec3 boundsMax;
+  float maxDepth;
+  float pixelEpsilon;
+};
+
+int bezierIdx(int u, int v){ return u * 4 + v; }
+
+vec3 bezierGet(in vec4 cp[16], int u, int v){ return cp[bezierIdx(u, v)].xyz; }
+
+BezierPatchData loadBezierPatch(uint index){
+  uint base = index * BEZIER_VEC4_PER_PATCH;
+  BezierPatchData result;
+  for(uint i=0u;i<16u;++i){ result.cp[i] = sBezier.data[base + i]; }
+  vec4 bounds0 = sBezier.data[base + 16u];
+  vec4 bounds1 = sBezier.data[base + 17u];
+  result.boundsMin = bounds0.xyz;
+  result.boundsMax = bounds1.xyz;
+  result.maxDepth = bounds0.w;
+  result.pixelEpsilon = bounds1.w;
+  return result;
+}
+
+void bezierEval(in vec4 cp[16], float u, float v, out vec3 P, out vec3 dPu, out vec3 dPv){
+  vec3 Cv[4];
+  for(int i=0;i<4;++i){
+    vec3 p0 = bezierGet(cp, i, 0);
+    vec3 p1 = bezierGet(cp, i, 1);
+    vec3 p2 = bezierGet(cp, i, 2);
+    vec3 p3 = bezierGet(cp, i, 3);
+    vec3 a = mix(p0, p1, v);
+    vec3 b = mix(p1, p2, v);
+    vec3 c = mix(p2, p3, v);
+    vec3 d = mix(a, b, v);
+    vec3 e = mix(b, c, v);
+    Cv[i] = mix(d, e, v);
+  }
+  vec3 A = mix(Cv[0], Cv[1], u);
+  vec3 B = mix(Cv[1], Cv[2], u);
+  vec3 C = mix(Cv[2], Cv[3], u);
+  vec3 D = mix(A, B, u);
+  vec3 E = mix(B, C, u);
+  P = mix(D, E, u);
+  dPu = 3.0 * (E - D);
+
+  vec3 Ru[4];
+  for(int j=0;j<4;++j){
+    vec3 p0 = bezierGet(cp, 0, j);
+    vec3 p1 = bezierGet(cp, 1, j);
+    vec3 p2 = bezierGet(cp, 2, j);
+    vec3 p3 = bezierGet(cp, 3, j);
+    vec3 a = mix(p0, p1, u);
+    vec3 b = mix(p1, p2, u);
+    vec3 c = mix(p2, p3, u);
+    vec3 d = mix(a, b, u);
+    vec3 e = mix(b, c, u);
+    Ru[j] = mix(d, e, u);
+  }
+  vec3 A2 = mix(Ru[0], Ru[1], v);
+  vec3 B2 = mix(Ru[1], Ru[2], v);
+  vec3 C2 = mix(Ru[2], Ru[3], v);
+  vec3 D2 = mix(A2, B2, v);
+  vec3 E2 = mix(B2, C2, v);
+  dPv = 3.0 * (E2 - D2);
+}
+
 void main(){
   const float EPS=1e-5;
   uvec2 pix=gl_LaunchIDEXT.xy; uvec2 dim=gl_LaunchSizeEXT.xy; uint gid=gl_GeometryIndexEXT; float t=gl_HitTEXT; vec3 ro=gl_WorldRayOriginEXT; vec3 rd=gl_WorldRayDirectionEXT; vec3 hp=ro+rd*t; vec3 col=vec3(0.6); vec3 light=normalize(vec3(0.3,0.7,0.5));
@@ -278,6 +725,17 @@ void main(){
     const float EPS=1e-5;
   if(z>halfH-EPS) n=axis; else if(z<-halfH+EPS) n=-axis; else { vec3 radial=lpl-axis*z; n=normalize(radial); }
     float diff=max(dot(n,light),0.0); col=mix(vec3(0.1,0.1,0.12), vec3(0.7,0.7,0.9), diff);
+  } else if(gid >= meta.m4.x && gid < meta.m4.x + meta.m4.y){
+    uint patchIndex = gid - meta.m4.x;
+    BezierPatchData patch = loadBezierPatch(patchIndex);
+    vec2 uv = clamp(attrUv, vec2(0.0), vec2(1.0));
+    vec3 dPu;
+    vec3 dPv;
+    bezierEval(patch.cp, uv.x, uv.y, hp, dPu, dPv);
+    vec3 n = normalize(cross(dPu, dPv));
+    if(dot(n, rd) > 0.0) n = -n;
+    float diff = max(dot(n, light), 0.0);
+    col = mix(vec3(0.05,0.07,0.1), vec3(0.95,0.55,0.25), diff);
   } else if(gid >= meta.m0.x && gid < meta.m0.x + meta.m0.y) {
     // torus shading from SSBO params
     uint i = gid - meta.m0.x; TorusParam tp = sTorus.items[i];

@@ -1,5 +1,9 @@
 #version 450
 
+#ifndef ENABLE_BEZIER_PATCHES
+#define ENABLE_BEZIER_PATCHES 1
+#endif
+
 // Use shared analytic intersection helpers
 #include "../../glsl/intersect.glsl"
 
@@ -13,7 +17,7 @@ layout(set = 0, binding = 0) uniform CameraUniform {
 	vec4 metrics0;       // x = primitive count, y = width, z = height, w = BVH nodes
 	vec4 metrics1;       // x = sphere count, y = cylinder count, z = circle count, w = ellipse count
 	vec4 metrics2;       // x = cone count, y = line count, z = torus count, w = plane count
-	vec4 metrics3;       // x = bezier count, y = bezier control count, z/w unused
+	vec4 metrics3;       // x = bezier count, y = bezier control count, z = debug flag, w = bezier upload flag
 } uCamera;
 
 layout(set = 0, binding = 1) readonly buffer SphereBuffer {
@@ -42,6 +46,62 @@ layout(set = 0, binding = 7) readonly buffer BezierBuffer {
 	vec4 bezierPrimitives[];
 };
 
+const uint DEBUG_COUNTER_STRIDE = 12u;
+const uint WORKGROUP_INVOCATIONS = 64u;
+
+struct DebugSample {
+	uint rayCount;
+	uint nodesTraversed;
+	uint leafTests;
+	uint primitiveTests;
+	uint bezierCandidateLeaves;
+	uint bezierNewtonIterations;
+	uint bezierHits;
+	uint bezierMisses;
+	uint bezierQueueOverflows;
+	uint bezierMaxQueue;
+	uint reservedCounter0;
+	uint reservedCounter1;
+};
+
+layout(set = 0, binding = 8) buffer DebugCounterBuffer {
+	uint counters[];
+} debugCounters;
+
+shared DebugSample sharedDebugSamples[WORKGROUP_INVOCATIONS];
+
+DebugSample makeDebugSample() {
+	DebugSample stats;
+	stats.rayCount = 0u;
+	stats.nodesTraversed = 0u;
+	stats.leafTests = 0u;
+	stats.primitiveTests = 0u;
+	stats.bezierCandidateLeaves = 0u;
+	stats.bezierNewtonIterations = 0u;
+	stats.bezierHits = 0u;
+	stats.bezierMisses = 0u;
+	stats.bezierQueueOverflows = 0u;
+	stats.bezierMaxQueue = 0u;
+	stats.reservedCounter0 = 0u;
+	stats.reservedCounter1 = 0u;
+	return stats;
+}
+
+void accumulateDebugSample(inout DebugSample total, DebugSample addend) {
+	total.rayCount += addend.rayCount;
+	total.nodesTraversed += addend.nodesTraversed;
+	total.leafTests += addend.leafTests;
+	total.primitiveTests += addend.primitiveTests;
+	total.bezierCandidateLeaves += addend.bezierCandidateLeaves;
+	total.bezierNewtonIterations += addend.bezierNewtonIterations;
+	total.bezierHits += addend.bezierHits;
+	total.bezierMisses += addend.bezierMisses;
+	total.bezierQueueOverflows += addend.bezierQueueOverflows;
+	total.bezierMaxQueue = max(total.bezierMaxQueue, addend.bezierMaxQueue);
+	total.reservedCounter0 += addend.reservedCounter0;
+	total.reservedCounter1 += addend.reservedCounter1;
+}
+
 const int PRIM_TYPE_SPHERE = 0;
 const int PRIM_TYPE_CYLINDER = 1;
 const int PRIM_TYPE_CIRCLE = 2;
@@ -50,6 +110,7 @@ const int PRIM_TYPE_CONE = 4;
 const int PRIM_TYPE_LINE = 5;
 const int PRIM_TYPE_TORUS = 6;
 const int PRIM_TYPE_PLANE = 7;
+const int PRIM_TYPE_BEZIER_PATCH = 8;
 
 struct HitInfo {
 	float t;
@@ -88,6 +149,477 @@ vec3 makeSafeInverse(vec3 dir) {
 	return 1.0 / safeDir;
 }
 
+bool intersectAabbExt(vec3 bmin, vec3 bmax, vec3 origin, vec3 invDir, float tMin, float tMax, out float tEnter, out float tExit) {
+	vec3 t0 = (bmin - origin) * invDir;
+	vec3 t1 = (bmax - origin) * invDir;
+	vec3 tmin = min(t0, t1);
+	vec3 tmax = max(t0, t1);
+	tEnter = max(max(max(tmin.x, tmin.y), tmin.z), tMin);
+	tExit = min(min(min(tmax.x, tmax.y), tmax.z), tMax);
+	return tExit >= tEnter;
+}
+
+#if ENABLE_BEZIER_PATCHES
+
+const uint BEZIER_VEC4_PER_PATCH = 18u;
+const int BEZIER_MAX_QUEUE = 64;
+const float BEZIER_LEAF_EDGE_SCALE = 0.68;
+const float BEZIER_RAY_CENTER_MARGIN = 1.03;
+const float BEZIER_MIN_FACING_ABS_DOT = 0.02;
+const float BEZIER_NEWTON_UV_MARGIN = 0.2;
+const float BEZIER_NEWTON_T_MARGIN = 1e-3;
+const float BEZIER_LEAF_BOX_MARGIN_SCALE = 0.04;
+
+
+struct BezierNode {
+	vec4 cp[16];
+	vec3 boundsMin;
+	vec3 boundsMax;
+	float u0;
+	float v0;
+	float u1;
+	float v1;
+	float tEnter;
+	int depth;
+};
+
+int bezierIdx(int u, int v) {
+	return u * 4 + v;
+}
+
+vec3 bezierGet(in vec4 cp[16], int u, int v) {
+	return cp[bezierIdx(u, v)].xyz;
+}
+
+void bezierSet(inout vec4 cp[16], int u, int v, vec3 value) {
+	cp[bezierIdx(u, v)] = vec4(value, 0.0);
+}
+
+void bezierEval(in vec4 cp[16], float u, float v, out vec3 P, out vec3 dPu, out vec3 dPv) {
+	vec3 Cv[4];
+	for (int i = 0; i < 4; ++i) {
+		vec3 p0 = bezierGet(cp, i, 0);
+		vec3 p1 = bezierGet(cp, i, 1);
+		vec3 p2 = bezierGet(cp, i, 2);
+		vec3 p3 = bezierGet(cp, i, 3);
+		vec3 a = mix(p0, p1, v);
+		vec3 b = mix(p1, p2, v);
+		vec3 c = mix(p2, p3, v);
+		vec3 d = mix(a, b, v);
+		vec3 e = mix(b, c, v);
+		Cv[i] = mix(d, e, v);
+	}
+	vec3 A = mix(Cv[0], Cv[1], u);
+	vec3 B = mix(Cv[1], Cv[2], u);
+	vec3 C = mix(Cv[2], Cv[3], u);
+	vec3 D = mix(A, B, u);
+	vec3 E = mix(B, C, u);
+	P = mix(D, E, u);
+	dPu = 3.0 * (E - D);
+
+	vec3 Ru[4];
+	for (int j = 0; j < 4; ++j) {
+		vec3 p0 = bezierGet(cp, 0, j);
+		vec3 p1 = bezierGet(cp, 1, j);
+		vec3 p2 = bezierGet(cp, 2, j);
+		vec3 p3 = bezierGet(cp, 3, j);
+		vec3 a = mix(p0, p1, u);
+		vec3 b = mix(p1, p2, u);
+		vec3 c = mix(p2, p3, u);
+		vec3 d = mix(a, b, u);
+		vec3 e = mix(b, c, u);
+		Ru[j] = mix(d, e, u);
+	}
+	vec3 A2 = mix(Ru[0], Ru[1], v);
+	vec3 B2 = mix(Ru[1], Ru[2], v);
+	vec3 C2 = mix(Ru[2], Ru[3], v);
+	vec3 D2 = mix(A2, B2, v);
+	vec3 E2 = mix(B2, C2, v);
+	dPv = 3.0 * (E2 - D2);
+}
+
+void splitAlongV(in vec4 srcPatch[16], out vec4 lo[16], out vec4 hi[16]) {
+	for (int i = 0; i < 4; ++i) {
+		vec3 a = bezierGet(srcPatch, i, 0);
+		vec3 b = bezierGet(srcPatch, i, 1);
+		vec3 c = bezierGet(srcPatch, i, 2);
+		vec3 d = bezierGet(srcPatch, i, 3);
+		vec3 ab = mix(a, b, 0.5);
+		vec3 bc = mix(b, c, 0.5);
+		vec3 cd = mix(c, d, 0.5);
+		vec3 abc = mix(ab, bc, 0.5);
+		vec3 bcd = mix(bc, cd, 0.5);
+		vec3 abcd = mix(abc, bcd, 0.5);
+		bezierSet(lo, i, 0, a);
+		bezierSet(lo, i, 1, ab);
+		bezierSet(lo, i, 2, abc);
+		bezierSet(lo, i, 3, abcd);
+		bezierSet(hi, i, 0, abcd);
+		bezierSet(hi, i, 1, bcd);
+		bezierSet(hi, i, 2, cd);
+		bezierSet(hi, i, 3, d);
+	}
+}
+
+void subdivideBezierPatch(in vec4 src[16], out vec4 c0[16], out vec4 c1[16], out vec4 c2[16], out vec4 c3[16]) {
+	vec4 left[16];
+	vec4 right[16];
+	for (int j = 0; j < 4; ++j) {
+		vec3 a = bezierGet(src, 0, j);
+		vec3 b = bezierGet(src, 1, j);
+		vec3 c = bezierGet(src, 2, j);
+		vec3 d = bezierGet(src, 3, j);
+		vec3 ab = mix(a, b, 0.5);
+		vec3 bc = mix(b, c, 0.5);
+		vec3 cd = mix(c, d, 0.5);
+		vec3 abc = mix(ab, bc, 0.5);
+		vec3 bcd = mix(bc, cd, 0.5);
+		vec3 abcd = mix(abc, bcd, 0.5);
+		bezierSet(left, 0, j, a);
+		bezierSet(left, 1, j, ab);
+		bezierSet(left, 2, j, abc);
+		bezierSet(left, 3, j, abcd);
+		bezierSet(right, 0, j, abcd);
+		bezierSet(right, 1, j, bcd);
+		bezierSet(right, 2, j, cd);
+		bezierSet(right, 3, j, d);
+	}
+	splitAlongV(left, c0, c2);
+	splitAlongV(right, c1, c3);
+}
+
+void computeBezierBounds(in vec4 cp[16], out vec3 bmin, out vec3 bmax) {
+	bmin = cp[0].xyz;
+	bmax = cp[0].xyz;
+	for (int i = 1; i < 16; ++i) {
+		vec3 p = cp[i].xyz;
+		bmin = min(bmin, p);
+		bmax = max(bmax, p);
+	}
+}
+
+bool newtonRefine(in vec4 cp[16], vec3 rayOrigin, vec3 rayDir, float tMin, float tMax, inout float u, inout float v, inout float t, inout DebugSample debugSample) {
+	const int MAX_IT = 4;
+	const float EPS_F = 1e-4;
+	const float EPS_P = 1e-5;
+	uint iterationCount = 0u;
+	bool success = false;
+	for (int iter = 0; iter < MAX_IT; ++iter) {
+		iterationCount++;
+		vec3 P;
+		vec3 dPu;
+		vec3 dPv;
+		bezierEval(cp, u, v, P, dPu, dPv);
+		vec3 F = P - (rayOrigin + rayDir * t);
+		float err = length(F);
+		if (err < EPS_F) {
+			bool inside = u >= -0.01 && u <= 1.01 && v >= -0.01 && v <= 1.01 && t >= tMin && t <= tMax;
+			success = inside;
+			break;
+		}
+		vec3 c0 = dPu;
+		vec3 c1 = dPv;
+		vec3 c2 = -rayDir;
+		vec3 r0 = cross(c1, c2);
+		vec3 r1 = cross(c2, c0);
+		vec3 r2 = cross(c0, c1);
+		float det = dot(c0, r0);
+		if (abs(det) < 1e-10) {
+			success = false;
+			break;
+		}
+		float invDet = -1.0 / det;
+		float du = dot(r0, F) * invDet;
+		float dv = dot(r1, F) * invDet;
+		float dt = dot(r2, F) * invDet;
+		u += du;
+		v += dv;
+		t += dt;
+		bool outOfDomain = (u < -BEZIER_NEWTON_UV_MARGIN || u > 1.0 + BEZIER_NEWTON_UV_MARGIN || v < -BEZIER_NEWTON_UV_MARGIN || v > 1.0 + BEZIER_NEWTON_UV_MARGIN);
+		bool outOfRange = (t < tMin - BEZIER_NEWTON_T_MARGIN || t > tMax + BEZIER_NEWTON_T_MARGIN);
+		if (outOfDomain || outOfRange) {
+			success = false;
+			break;
+		}
+		if (abs(du) < EPS_P && abs(dv) < EPS_P && abs(dt) < EPS_P) {
+			vec3 P2;
+			vec3 tmpDu;
+			vec3 tmpDv;
+			bezierEval(cp, u, v, P2, tmpDu, tmpDv);
+			vec3 F2 = P2 - (rayOrigin + rayDir * t);
+			float err2 = length(F2);
+			bool inside = u >= -0.01 && u <= 1.01 && v >= -0.01 && v <= 1.01 && t >= tMin && t <= tMax;
+			if (inside && err2 < EPS_F) {
+				success = true;
+				break;
+			}
+		}
+	}
+	debugSample.bezierNewtonIterations += iterationCount;
+	return success;
+}
+
+bool intersectBezierPatch(
+	vec3 rayOrigin,
+	float rayTMin,
+	vec3 rayDir,
+	float rayTMax,
+	int patchIndex,
+	int bezierVec4Count,
+	float pixelWorldSlope,
+	out float hitT,
+	out vec2 hitUV,
+	out vec3 hitNormal,
+	inout DebugSample debugSample
+) {
+	int base = patchIndex * int(BEZIER_VEC4_PER_PATCH);
+	if (base < 0 || base + int(BEZIER_VEC4_PER_PATCH) > bezierVec4Count) {
+		return false;
+	}
+	vec4 bounds0 = bezierPrimitives[base + 16];
+	vec4 bounds1 = bezierPrimitives[base + 17];
+	vec3 boundsMin = bounds0.xyz;
+	vec3 boundsMax = bounds1.xyz;
+	float maxDepthF = bounds0.w;
+	float pixelEpsilon = bounds1.w;
+
+	vec3 invDir = makeSafeInverse(rayDir);
+	float enterT;
+	float exitT;
+	float farLimit = rayTMax;
+	if (!intersectAabbExt(boundsMin, boundsMax, rayOrigin, invDir, rayTMin, farLimit, enterT, exitT)) {
+		return false;
+	}
+
+	vec4 rootCp[16];
+	for (int i = 0; i < 16; ++i) {
+		rootCp[i] = bezierPrimitives[base + i];
+	}
+
+	float bestT = min(rayTMax, exitT);
+	vec2 bestUV = vec2(0.0);
+	vec3 bestNormal = vec3(0.0);
+	float pixelEps = max(pixelEpsilon, 1e-4);
+	int maxDepth = clamp(int(floor(maxDepthF + 0.5)), 1, 8);
+	vec3 rootExtents = boundsMax - boundsMin;
+	float rootMaxEdge = max(max(rootExtents.x, rootExtents.y), rootExtents.z);
+	bool hasHit = false;
+	float depthEdgeTarget = rootMaxEdge * exp2(-float(maxDepth));
+	float baseLeafEdge = max(pixelEps, depthEdgeTarget);
+	BezierNode queue[BEZIER_MAX_QUEUE];
+	int size = 0;
+	BezierNode root;
+	for (int i = 0; i < 16; ++i) { root.cp[i] = rootCp[i]; }
+	root.boundsMin = boundsMin;
+	root.boundsMax = boundsMax;
+	root.u0 = 0.0;
+	root.v0 = 0.0;
+	root.u1 = 1.0;
+	root.v1 = 1.0;
+	root.tEnter = enterT;
+	root.depth = 0;
+	queue[size++] = root;
+	debugSample.bezierMaxQueue = max(debugSample.bezierMaxQueue, uint(size));
+	while (size > 0) {
+		BezierNode node = queue[--size];
+		if (node.tEnter >= bestT) {
+			continue;
+		}
+	vec3 extents = node.boundsMax - node.boundsMin;
+	float maxEdge = max(max(extents.x, extents.y), extents.z);
+	float distanceEstimate = max(max(node.tEnter, rayTMin), 0.0);
+		float screenLeafEdge = max(distanceEstimate * pixelWorldSlope, 1e-4);
+	float nodeLeafEdge = max(baseLeafEdge, screenLeafEdge) * BEZIER_LEAF_EDGE_SCALE;
+	bool leaf = (maxEdge <= nodeLeafEdge) || (node.depth >= maxDepth);
+		if (leaf) {
+			float tUpper = min(bestT, rayTMax);
+			float radius = max(0.5 * maxEdge * BEZIER_RAY_CENTER_MARGIN, 1e-4);
+			vec3 nodeCenter = 0.5 * (node.boundsMin + node.boundsMax);
+			vec3 toCenter = nodeCenter - rayOrigin;
+			float proj = dot(toCenter, rayDir);
+			float closestT = clamp(proj, rayTMin, tUpper);
+			vec3 closestPoint = rayOrigin + rayDir * closestT;
+			vec3 centerDelta = nodeCenter - closestPoint;
+			float centerDistSq = dot(centerDelta, centerDelta);
+			if (centerDistSq > radius * radius) {
+				debugSample.bezierMisses += 1u;
+				continue;
+			}
+			debugSample.bezierCandidateLeaves += 1u;
+			float uLocal = 0.5;
+			float vLocal = 0.5;
+			float tCandidate = clamp(node.tEnter, rayTMin, tUpper);
+			vec3 midpoint;
+			vec3 midDu;
+			vec3 midDv;
+			bezierEval(node.cp, 0.5, 0.5, midpoint, midDu, midDv);
+			vec3 midNormal = cross(midDu, midDv);
+			float normalLen = length(midNormal);
+			if (normalLen > 1e-8) {
+				float denom = dot(midNormal, rayDir);
+				if (abs(denom) > BEZIER_MIN_FACING_ABS_DOT) {
+					float planeT = dot(midNormal, midpoint - rayOrigin) / denom;
+					if (planeT >= rayTMin && planeT <= tUpper) {
+						tCandidate = planeT;
+					}
+				} else {
+					debugSample.bezierMisses += 1u;
+					continue;
+				}
+			}
+			float boxMargin = max(maxEdge * BEZIER_LEAF_BOX_MARGIN_SCALE, 1e-4);
+			vec3 candidatePoint = rayOrigin + rayDir * tCandidate;
+			if (candidatePoint.x < node.boundsMin.x - boxMargin || candidatePoint.x > node.boundsMax.x + boxMargin ||
+				candidatePoint.y < node.boundsMin.y - boxMargin || candidatePoint.y > node.boundsMax.y + boxMargin ||
+				candidatePoint.z < node.boundsMin.z - boxMargin || candidatePoint.z > node.boundsMax.z + boxMargin) {
+				debugSample.bezierMisses += 1u;
+				continue;
+			}
+			bool refined = newtonRefine(node.cp, rayOrigin, rayDir, rayTMin, tUpper, uLocal, vLocal, tCandidate, debugSample);
+			if (refined) {
+				if (tCandidate >= rayTMin && tCandidate < bestT && tCandidate <= rayTMax) {
+					float uGlobal = mix(node.u0, node.u1, clamp(uLocal, 0.0, 1.0));
+					float vGlobal = mix(node.v0, node.v1, clamp(vLocal, 0.0, 1.0));
+					vec3 posEval;
+					vec3 dPu;
+					vec3 dPv;
+					bezierEval(node.cp, uGlobal, vGlobal, posEval, dPu, dPv);
+					bestT = tCandidate;
+					bestUV = vec2(uGlobal, vGlobal);
+					bestNormal = safeNormalize(cross(dPu, dPv));
+					hasHit = true;
+					debugSample.bezierHits += 1u;
+				} else {
+					debugSample.bezierMisses += 1u;
+				}
+			} else {
+				debugSample.bezierMisses += 1u;
+			}
+			continue;
+		}
+		vec4 child0[16];
+		vec4 child1[16];
+		vec4 child2[16];
+		vec4 child3[16];
+		subdivideBezierPatch(node.cp, child0, child1, child2, child3);
+		float uMid = 0.5 * (node.u0 + node.u1);
+		float vMid = 0.5 * (node.v0 + node.v1);
+		float farBound = min(bestT, rayTMax);
+		BezierNode children[4];
+		float childEnter[4];
+		int childCount = 0;
+		vec3 bmin;
+		vec3 bmax;
+		float enterChild;
+		float exitChild;
+		computeBezierBounds(child0, bmin, bmax);
+		if (intersectAabbExt(bmin, bmax, rayOrigin, invDir, rayTMin, farBound, enterChild, exitChild)) {
+			BezierNode child;
+			for (int k = 0; k < 16; ++k) { child.cp[k] = child0[k]; }
+			child.boundsMin = bmin - vec3(1e-6);
+			child.boundsMax = bmax + vec3(1e-6);
+			child.depth = node.depth + 1;
+			child.u0 = node.u0; child.u1 = uMid; child.v0 = node.v0; child.v1 = vMid;
+			child.tEnter = enterChild;
+			children[childCount] = child;
+			childEnter[childCount] = enterChild;
+			childCount++;
+		}
+		computeBezierBounds(child1, bmin, bmax);
+		if (intersectAabbExt(bmin, bmax, rayOrigin, invDir, rayTMin, farBound, enterChild, exitChild)) {
+			BezierNode child;
+			for (int k = 0; k < 16; ++k) { child.cp[k] = child1[k]; }
+			child.boundsMin = bmin - vec3(1e-6);
+			child.boundsMax = bmax + vec3(1e-6);
+			child.depth = node.depth + 1;
+			child.u0 = uMid; child.u1 = node.u1; child.v0 = node.v0; child.v1 = vMid;
+			child.tEnter = enterChild;
+			children[childCount] = child;
+			childEnter[childCount] = enterChild;
+			childCount++;
+		}
+		computeBezierBounds(child2, bmin, bmax);
+		if (intersectAabbExt(bmin, bmax, rayOrigin, invDir, rayTMin, farBound, enterChild, exitChild)) {
+			BezierNode child;
+			for (int k = 0; k < 16; ++k) { child.cp[k] = child2[k]; }
+			child.boundsMin = bmin - vec3(1e-6);
+			child.boundsMax = bmax + vec3(1e-6);
+			child.depth = node.depth + 1;
+			child.u0 = node.u0; child.u1 = uMid; child.v0 = vMid; child.v1 = node.v1;
+			child.tEnter = enterChild;
+			children[childCount] = child;
+			childEnter[childCount] = enterChild;
+			childCount++;
+		}
+		computeBezierBounds(child3, bmin, bmax);
+		if (intersectAabbExt(bmin, bmax, rayOrigin, invDir, rayTMin, farBound, enterChild, exitChild)) {
+			BezierNode child;
+			for (int k = 0; k < 16; ++k) { child.cp[k] = child3[k]; }
+			child.boundsMin = bmin - vec3(1e-6);
+			child.boundsMax = bmax + vec3(1e-6);
+			child.depth = node.depth + 1;
+			child.u0 = uMid; child.u1 = node.u1; child.v0 = vMid; child.v1 = node.v1;
+			child.tEnter = enterChild;
+			children[childCount] = child;
+			childEnter[childCount] = enterChild;
+			childCount++;
+		}
+		for (int a = 0; a < childCount - 1; ++a) {
+			for (int b = a + 1; b < childCount; ++b) {
+				if (childEnter[a] < childEnter[b]) {
+					BezierNode tmpNode = children[a];
+					children[a] = children[b];
+					children[b] = tmpNode;
+					float tmpEnter = childEnter[a];
+					childEnter[a] = childEnter[b];
+					childEnter[b] = tmpEnter;
+				}
+			}
+		}
+		for (int c = 0; c < childCount; ++c) {
+			if (size >= BEZIER_MAX_QUEUE) {
+				debugSample.bezierQueueOverflows += 1u;
+				break;
+			}
+			queue[size++] = children[c];
+			debugSample.bezierMaxQueue = max(debugSample.bezierMaxQueue, uint(size));
+		}
+	}
+	if (hasHit && bestT < min(rayTMax, 1e37)) {
+		hitT = bestT;
+		hitUV = clamp(bestUV, vec2(0.0), vec2(1.0));
+		hitNormal = bestNormal;
+		return true;
+	}
+	return false;
+}
+
+#else // ENABLE_BEZIER_PATCHES
+
+const uint BEZIER_VEC4_PER_PATCH = 0u;
+
+bool intersectBezierPatch(
+	vec3 rayOrigin,
+	float rayTMin,
+	vec3 rayDir,
+	float rayTMax,
+	int patchIndex,
+	int bezierVec4Count,
+	float pixelWorldSlope,
+	out float hitT,
+	out vec2 hitUV,
+	out vec3 hitNormal,
+	inout DebugSample debugSample
+){
+	// Stub keeps interface stable when Bézier support is disabled at compile time.
+	hitT = rayTMax;
+	hitUV = vec2(0.0);
+	hitNormal = vec3(0.0);
+	return false;
+}
+
+#endif // ENABLE_BEZIER_PATCHES
+
 bool intersectAabb(vec3 bmin, vec3 bmax, vec3 origin, vec3 invDir, float nearT, float farT) {
 	vec3 t0 = (bmin - origin) * invDir;
 	vec3 t1 = (bmax - origin) * invDir;
@@ -106,6 +638,7 @@ void evaluatePrimitive(
 	vec3 rayDir,
 	float farPlane,
 	inout HitInfo closest,
+	float pixelWorldSlope,
 	int sphereCount,
 	int cylinderCount,
 	int circleCount,
@@ -114,8 +647,12 @@ void evaluatePrimitive(
 	int lineCount,
 	int torusCount,
 	int planeCount,
-	int analyticVec4Count
+	int analyticVec4Count,
+	int bezierCount,
+	int bezierVec4Count,
+	inout DebugSample debugSample
 ){
+	debugSample.primitiveTests += 1u;
 	int type = int(ref.x);
 	int idxInType = int(ref.y);
 	int analyticBase = int(ref.z);
@@ -295,6 +832,26 @@ void evaluatePrimitive(
 			}
 			break;
 		}
+
+#if ENABLE_BEZIER_PATCHES
+		case PRIM_TYPE_BEZIER_PATCH: {
+			if (idxInType < bezierCount && bezierVec4Count >= int(BEZIER_VEC4_PER_PATCH)) {
+				float tHit;
+				vec2 uvHit;
+				vec3 normal;
+				if (intersectBezierPatch(cameraPos, nearPlane, rayDir, maxDistance, int(idxInType), bezierVec4Count, pixelWorldSlope, tHit, uvHit, normal, debugSample) && tHit < closest.t) {
+					if (dot(normal, rayDir) > 0.0) {
+						normal = -normal;
+					}
+					closest.t = tHit;
+					closest.normal = normal;
+					closest.primitiveId = int(primitiveSlot);
+					closest.type = PRIM_TYPE_BEZIER_PATCH;
+				}
+			}
+			break;
+		}
+#endif
 		default:
 			break;
 	}
@@ -306,6 +863,7 @@ void traverseBvh(
 	vec3 rayDir,
 	float farPlane,
 	inout HitInfo closest,
+	float pixelWorldSlope,
 	int sphereCount,
 	int cylinderCount,
 	int circleCount,
@@ -315,8 +873,11 @@ void traverseBvh(
 	int torusCount,
 	int planeCount,
 	int analyticVec4Count,
+	int bezierCount,
+	int bezierVec4Count,
 	int primitiveCount,
-	int metricNodeCount
+	int metricNodeCount,
+	inout DebugSample debugSample
 ){
 	if (primitiveCount <= 0 || metricNodeCount <= 0) {
 		return;
@@ -339,6 +900,7 @@ void traverseBvh(
 		if (nodeBase + BVH_NODE_UINTS > bvhNodes.length()) {
 			break;
 		}
+		debugSample.nodesTraversed += 1u;
 		vec3 nodeMin = vec3(
 			uintBitsToFloat(bvhNodes[nodeBase + 0]),
 			uintBitsToFloat(bvhNodes[nodeBase + 1]),
@@ -362,6 +924,7 @@ void traverseBvh(
 		bool intersects = intersectAabb(nodeMin, nodeMax, cameraPos, invDir, nearT, farLimit);
 		if (intersects) {
 			if (leafFlag != 0u) {
+				debugSample.leafTests += 1u;
 				uint primitiveSlot = primitiveIndexRaw;
 				int indexLength = primitiveIndices.length();
 				if (indexLength > 0 && primitiveIndexRaw < uint(indexLength)) {
@@ -371,9 +934,10 @@ void traverseBvh(
 					int refLength = primitiveRefs.length();
 					if (refLength > 0 && primitiveSlot < uint(refLength) && int(primitiveSlot) < primitiveCount) {
 						uvec4 ref = primitiveRefs[primitiveSlot];
-						evaluatePrimitive(ref, primitiveSlot, cameraPos, nearPlane, rayDir, farPlane, closest,
-							sphereCount, cylinderCount, circleCount, ellipseCount,
-							coneCount, lineCount, torusCount, planeCount, analyticVec4Count);
+						evaluatePrimitive(ref, primitiveSlot, cameraPos, nearPlane, rayDir, farPlane, closest, pixelWorldSlope,
+								sphereCount, cylinderCount, circleCount, ellipseCount,
+								coneCount, lineCount, torusCount, planeCount, analyticVec4Count,
+							bezierCount, bezierVec4Count, debugSample);
 					}
 				}
 				nodeIndex = exitNode;
@@ -424,6 +988,8 @@ vec3 shade(vec3 normal, vec3 viewDir, int primType, int primId) {
 		baseColor = vec3(0.20, 0.66, 0.92);
 	} else if (primType == PRIM_TYPE_PLANE) {
 		baseColor = vec3(0.32, 0.36, 0.42);
+	} else if (primType == PRIM_TYPE_BEZIER_PATCH) {
+		baseColor = vec3(0.95, 0.54, 0.24);
 	}
 
 	vec3 ambient = baseColor * 0.18;
@@ -438,299 +1004,375 @@ void main() {
 
 	float width = uCamera.metrics0.y;
 	float height = uCamera.metrics0.z;
+	uint widthU = uint(max(width, 0.0));
+	uint heightU = uint(max(height, 0.0));
+	bool isActive = gid.x < widthU && gid.y < heightU;
 
-	if (gid.x >= uint(width) || gid.y >= uint(height)) {
-		return;
-	}
+	DebugSample debugSample = makeDebugSample();
+	bool debugTelemetryEnabled = (uCamera.metrics3.z > 0.5);
 
-	int heightInt = int(height + 0.5);
-	ivec2 storeCoord = ivec2(int(gid.x), heightInt - 1 - int(gid.y));
+	if (isActive) {
+		debugSample.rayCount = 1u;
 
-	vec2 pixel = vec2(gid) + vec2(0.5);
-	vec2 ndc;
-	ndc.x = pixel.x / max(width, 1.0);
-	ndc.y = pixel.y / max(height, 1.0);
-	ndc = ndc * 2.0 - 1.0;
-	ndc.y = -ndc.y;
+		int heightInt = int(height + 0.5);
+		ivec2 storeCoord = ivec2(int(gid.x), heightInt - 1 - int(gid.y));
 
-	vec3 cameraPos = uCamera.camPosNear.xyz;
-	vec3 forward = normalize(uCamera.camForwardTan.xyz);
-	vec3 right = normalize(uCamera.camRightAspect.xyz);
-	vec3 up = normalize(uCamera.camUpFar.xyz);
-	float tanHalfFov = uCamera.camForwardTan.w;
-	float aspect = max(uCamera.camRightAspect.w, 1e-4);
+		vec2 pixel = vec2(gid) + vec2(0.5);
+		vec2 ndc;
+		ndc.x = pixel.x / max(width, 1.0);
+		ndc.y = pixel.y / max(height, 1.0);
+		ndc = ndc * 2.0 - 1.0;
+		ndc.y = -ndc.y;
 
-	vec3 rayDir = normalize(
-		forward +
-		ndc.x * aspect * tanHalfFov * right +
-		ndc.y * tanHalfFov * up
-	);
+		vec3 cameraPos = uCamera.camPosNear.xyz;
+		vec3 forward = normalize(uCamera.camForwardTan.xyz);
+		vec3 right = normalize(uCamera.camRightAspect.xyz);
+		vec3 up = normalize(uCamera.camUpFar.xyz);
+		float tanHalfFov = uCamera.camForwardTan.w;
+		float aspect = max(uCamera.camRightAspect.w, 1e-4);
+		float pixelWorldSlope = (2.0 * tanHalfFov) / max(height, 1.0);
 
-	int primitiveCount = int(uCamera.metrics0.x + 0.5);
-	HitInfo closest = makeMiss();
-	int sphereCount = int(uCamera.metrics1.x + 0.5);
-	int cylinderCount = int(uCamera.metrics1.y + 0.5);
-	int circleCount = int(uCamera.metrics1.z + 0.5);
-	int ellipseCount = int(uCamera.metrics1.w + 0.5);
-	int coneCount = int(uCamera.metrics2.x + 0.5);
-	int lineCount = int(uCamera.metrics2.y + 0.5);
-	int torusCount = int(uCamera.metrics2.z + 0.5);
-	int planeCount = int(uCamera.metrics2.w + 0.5);
-	int analyticVec4Count = int(analyticPrimitives.length());
-
-	int analyticBaseCylinder = 0;
-	int analyticBaseCircle = analyticBaseCylinder + cylinderCount;
-	int analyticBaseEllipse = analyticBaseCircle + circleCount;
-	int analyticBaseCone = analyticBaseEllipse + ellipseCount;
-	int analyticBaseLine = analyticBaseCone + coneCount;
-	int analyticBaseTorus = analyticBaseLine + lineCount;
-	int analyticBasePlane = analyticBaseTorus + torusCount;
-
-	// Touch all storage buffers so that translators keep bindings alive even when
-	// the shader path does not actively consume them. Removing these guards would
-	// cause dead-code elimination to drop the bindings and break the pipeline.
-	if (uCamera.metrics0.x < -1.0) {
-		uint guard = 0u;
-		guard += uint(bvhNodes.length());
-		guard += uint(primitiveIndices.length());
-		guard += uint(primitiveRefs.length());
-		guard += uint(analyticPrimitives.length());
-		guard += uint(bezierPrimitives.length());
-		if (guard == 0u) {
-			imageStore(outputImage, ivec2(0), vec4(0.0));
-		}
-	}
-
-	float nearPlane = max(uCamera.camPosNear.w, 1e-4);
-	float farPlane = uCamera.camUpFar.w;
-	if (farPlane <= nearPlane) {
-		farPlane = 1e30;
-	}
-
-	int metricNodeCount = int(uCamera.metrics0.w + 0.5);
-	int totalNodeCount = bvhNodes.length() / BVH_NODE_UINTS;
-	int primitiveRefCount = primitiveRefs.length();
-	bool canUseBvh = primitiveCount > 0 && metricNodeCount > 0 && totalNodeCount > 0 && primitiveRefCount > 0;
-	if (canUseBvh && primitiveCount > primitiveRefCount) {
-		canUseBvh = false;
-	}
-
-	if (canUseBvh) {
-		traverseBvh(
-			cameraPos,
-			nearPlane,
-			rayDir,
-			farPlane,
-			closest,
-			sphereCount,
-			cylinderCount,
-			circleCount,
-			ellipseCount,
-			coneCount,
-			lineCount,
-			torusCount,
-			planeCount,
-			analyticVec4Count,
-			primitiveCount,
-			metricNodeCount
+		vec3 rayDir = normalize(
+			forward +
+			ndc.x * aspect * tanHalfFov * right +
+			ndc.y * tanHalfFov * up
 		);
-	} else {
-		for (int i = 0; i < sphereCount; ++i) {
-			if (i >= spheres.length()) {
-				break;
-			}
-			float t;
-			vec3 rawNormal;
-			bool hit = intersect_sphere(cameraPos, nearPlane, rayDir, farPlane,
-									 spheres[i].xyz, spheres[i].w, t, rawNormal);
-			if (hit && t < closest.t) {
-				closest.t = t;
-				closest.normal = safeNormalize(rawNormal);
-				closest.primitiveId = i;
-				closest.type = PRIM_TYPE_SPHERE;
+
+		int primitiveCount = int(uCamera.metrics0.x + 0.5);
+		HitInfo closest = makeMiss();
+		int sphereCount = int(uCamera.metrics1.x + 0.5);
+		int cylinderCount = int(uCamera.metrics1.y + 0.5);
+		int circleCount = int(uCamera.metrics1.z + 0.5);
+		int ellipseCount = int(uCamera.metrics1.w + 0.5);
+		int coneCount = int(uCamera.metrics2.x + 0.5);
+		int lineCount = int(uCamera.metrics2.y + 0.5);
+		int torusCount = int(uCamera.metrics2.z + 0.5);
+		int planeCount = int(uCamera.metrics2.w + 0.5);
+		bool bezierUploadsEnabled = (uCamera.metrics3.w > 0.5);
+		int analyticVec4Count = int(analyticPrimitives.length());
+		int bezierCount = bezierUploadsEnabled ? int(uCamera.metrics3.x + 0.5) : 0;
+		int bezierVec4Count = bezierUploadsEnabled ? int(bezierPrimitives.length()) : 0;
+
+		int analyticBaseCylinder = 0;
+		int analyticBaseCircle = analyticBaseCylinder + cylinderCount;
+		int analyticBaseEllipse = analyticBaseCircle + circleCount;
+		int analyticBaseCone = analyticBaseEllipse + ellipseCount;
+		int analyticBaseLine = analyticBaseCone + coneCount;
+		int analyticBaseTorus = analyticBaseLine + lineCount;
+		int analyticBasePlane = analyticBaseTorus + torusCount;
+
+		// Touch all storage buffers so that translators keep bindings alive even when
+		// the shader path does not actively consume them. Removing these guards would
+		// cause dead-code elimination to drop the bindings and break the pipeline.
+		if (uCamera.metrics0.x < -1.0) {
+			uint guard = 0u;
+			guard += uint(bvhNodes.length());
+			guard += uint(primitiveIndices.length());
+			guard += uint(primitiveRefs.length());
+			guard += uint(analyticPrimitives.length());
+			guard += uint(bezierPrimitives.length());
+			if (guard == 0u) {
+				imageStore(outputImage, ivec2(0), vec4(0.0));
 			}
 		}
 
-		for (int i = 0; i < cylinderCount; ++i) {
-			int vecIndex = (analyticBaseCylinder + i) * 3;
-			if (vecIndex + 2 >= analyticVec4Count) { break; }
-			vec4 c0 = analyticPrimitives[vecIndex + 0];
-			vec4 c1 = analyticPrimitives[vecIndex + 1];
-			vec4 c2 = analyticPrimitives[vecIndex + 2];
-			float t;
-			vec3 normal;
-			float angleDeg = (c2.w <= 0.0) ? 360.0 : c2.w;
-			bool hit = intersect_cylinder(
-				cameraPos, nearPlane, rayDir, farPlane,
-				c0.xyz, c1.xyz, c2.xyz,
-				c0.w, c1.w, angleDeg,
-				t, normal
+		float nearPlane = max(uCamera.camPosNear.w, 1e-4);
+		float farPlane = uCamera.camUpFar.w;
+		if (farPlane <= nearPlane) {
+			farPlane = 1e30;
+		}
+
+		int metricNodeCount = int(uCamera.metrics0.w + 0.5);
+		int totalNodeCount = bvhNodes.length() / BVH_NODE_UINTS;
+		int primitiveRefCount = primitiveRefs.length();
+		bool canUseBvh = primitiveCount > 0 && metricNodeCount > 0 && totalNodeCount > 0 && primitiveRefCount > 0;
+		if (canUseBvh && primitiveCount > primitiveRefCount) {
+			canUseBvh = false;
+		}
+
+		if (canUseBvh) {
+			traverseBvh(
+				cameraPos,
+				nearPlane,
+				rayDir,
+				farPlane,
+				closest,
+				pixelWorldSlope,
+				sphereCount,
+				cylinderCount,
+				circleCount,
+				ellipseCount,
+				coneCount,
+				lineCount,
+				torusCount,
+				planeCount,
+				analyticVec4Count,
+				bezierCount,
+				bezierVec4Count,
+				primitiveCount,
+				metricNodeCount,
+				debugSample
 			);
-			if (hit && t < closest.t) {
-				closest.t = t;
-				closest.normal = safeNormalize(normal);
-				closest.primitiveId = i;
-				closest.type = PRIM_TYPE_CYLINDER;
-			}
-		}
-
-		for (int i = 0; i < circleCount; ++i) {
-			int vecIndex = (analyticBaseCircle + i) * 3;
-			if (vecIndex + 2 >= analyticVec4Count) { break; }
-			vec4 c0 = analyticPrimitives[vecIndex + 0];
-			vec4 c1 = analyticPrimitives[vecIndex + 1];
-			vec4 c2 = analyticPrimitives[vecIndex + 2];
-			float t;
-			vec3 normal;
-			bool hit = intersect_circle(
-				cameraPos, nearPlane, rayDir, farPlane,
-				c0.xyz, c1.xyz, c2.xyz, c0.w,
-				t, normal
-			);
-			if (hit && t < closest.t) {
-				closest.t = t;
-				closest.normal = safeNormalize(normal);
-				closest.primitiveId = i;
-				closest.type = PRIM_TYPE_CIRCLE;
-			}
-		}
-
-		for (int i = 0; i < ellipseCount; ++i) {
-			int vecIndex = (analyticBaseEllipse + i) * 3;
-			if (vecIndex + 2 >= analyticVec4Count) { break; }
-			vec4 c0 = analyticPrimitives[vecIndex + 0];
-			vec4 c1 = analyticPrimitives[vecIndex + 1];
-			vec4 c2 = analyticPrimitives[vecIndex + 2];
-			float t;
-			vec3 normal;
-			bool hit = intersect_ellipse(
-				cameraPos, nearPlane, rayDir, farPlane,
-				c0.xyz, c1.xyz, c2.xyz,
-				c0.w, c1.w,
-				t, normal
-			);
-			if (hit && t < closest.t) {
-				closest.t = t;
-				closest.normal = safeNormalize(normal);
-				closest.primitiveId = i;
-				closest.type = PRIM_TYPE_ELLIPSE;
-			}
-		}
-
-		for (int i = 0; i < coneCount; ++i) {
-			int vecIndex = (analyticBaseCone + i) * 3;
-			if (vecIndex + 2 >= analyticVec4Count) { break; }
-			vec4 c0 = analyticPrimitives[vecIndex + 0];
-			vec4 c1 = analyticPrimitives[vecIndex + 1];
-			vec4 c2 = analyticPrimitives[vecIndex + 2];
-			vec3 xdir = normalize(c1.xyz);
-			vec3 ydir = normalize(c2.xyz);
-			vec3 axis = normalize(cross(xdir, ydir));
-			float t;
-			vec3 normal;
-			bool hit = intersect_cone_open(
-				cameraPos, nearPlane, rayDir, farPlane,
-				c0.xyz, axis, c1.w, c0.w,
-				t, normal
-			);
-			if (hit && t < closest.t) {
-				closest.t = t;
-				closest.normal = safeNormalize(normal);
-				closest.primitiveId = i;
-				closest.type = PRIM_TYPE_CONE;
-			}
-		}
-
-		for (int i = 0; i < lineCount; ++i) {
-			int vecIndex = (analyticBaseLine + i) * 3;
-			if (vecIndex + 1 >= analyticVec4Count) { break; }
-			vec4 c0 = analyticPrimitives[vecIndex + 0];
-			vec4 c1 = analyticPrimitives[vecIndex + 1];
-			float radius = max(c0.w, 1e-4);
-			float t;
-			vec3 normal;
-			bool hit = intersect_line_segment(
-				cameraPos, nearPlane, rayDir, farPlane,
-				c0.xyz, c1.xyz, radius,
-				t, normal
-			);
-			if (hit && t < closest.t) {
-				closest.t = t;
-				closest.normal = safeNormalize(normal);
-				closest.primitiveId = i;
-				closest.type = PRIM_TYPE_LINE;
-			}
-		}
-
-		for (int i = 0; i < torusCount; ++i) {
-			int vecIndex = (analyticBaseTorus + i) * 3;
-			if (vecIndex + 2 >= analyticVec4Count) { break; }
-			vec4 c0 = analyticPrimitives[vecIndex + 0];
-			vec4 c1 = analyticPrimitives[vecIndex + 1];
-			vec4 c2 = analyticPrimitives[vecIndex + 2];
-			float angleDeg = c2.w;
-			float t;
-			vec3 normal;
-			bool hit;
-			if (angleDeg >= 0.0 && angleDeg < 359.5) {
-				hit = intersect_torus_wedge(
-					cameraPos, nearPlane, rayDir, farPlane,
-					c0.xyz, c1.xyz, c2.xyz, c0.w, c1.w, angleDeg,
-					t, normal
-				);
-			} else {
-				hit = intersect_torus(
-					cameraPos, nearPlane, rayDir, farPlane,
-					c0.xyz, c1.xyz, c2.xyz, c0.w, c1.w,
-					t, normal
-				);
-			}
-			if (hit && t < closest.t) {
-				closest.t = t;
-				closest.normal = safeNormalize(normal);
-				closest.primitiveId = i;
-				closest.type = PRIM_TYPE_TORUS;
-			}
-		}
-
-		for (int i = 0; i < planeCount; ++i) {
-			int vecIndex = (analyticBasePlane + i) * 3;
-			if (vecIndex + 2 >= analyticVec4Count) { break; }
-			vec4 c0 = analyticPrimitives[vecIndex + 0];
-			vec4 c1 = analyticPrimitives[vecIndex + 1];
-			vec4 c2 = analyticPrimitives[vecIndex + 2];
-			float t;
-			vec3 normal;
-			bool hit = intersect_plane_rect(
-				cameraPos, nearPlane, rayDir, farPlane,
-				c0.xyz, c1.xyz, c2.xyz,
-				c0.w, c1.w,
-				t, normal
-			);
-			if (hit && t < closest.t) {
-				if (dot(normal, rayDir) > 0.0) {
-					normal = -normal;
+		} else {
+			for (int i = 0; i < sphereCount; ++i) {
+				if (i >= spheres.length()) {
+					break;
 				}
-				closest.t = t;
-				closest.normal = safeNormalize(normal);
-				closest.primitiveId = i;
-				closest.type = PRIM_TYPE_PLANE;
+				debugSample.primitiveTests += 1u;
+				float t;
+				vec3 rawNormal;
+				bool hit = intersect_sphere(cameraPos, nearPlane, rayDir, farPlane,
+										 spheres[i].xyz, spheres[i].w, t, rawNormal);
+				if (hit && t < closest.t) {
+					closest.t = t;
+					closest.normal = safeNormalize(rawNormal);
+					closest.primitiveId = i;
+					closest.type = PRIM_TYPE_SPHERE;
+				}
 			}
+
+			for (int i = 0; i < cylinderCount; ++i) {
+				int vecIndex = (analyticBaseCylinder + i) * 3;
+				if (vecIndex + 2 >= analyticVec4Count) { break; }
+				debugSample.primitiveTests += 1u;
+				vec4 c0 = analyticPrimitives[vecIndex + 0];
+				vec4 c1 = analyticPrimitives[vecIndex + 1];
+				vec4 c2 = analyticPrimitives[vecIndex + 2];
+				float t;
+				vec3 normal;
+				float angleDeg = (c2.w <= 0.0) ? 360.0 : c2.w;
+				bool hit = intersect_cylinder(
+					cameraPos, nearPlane, rayDir, farPlane,
+					c0.xyz, c1.xyz, c2.xyz,
+					c0.w, c1.w, angleDeg,
+					t, normal
+				);
+				if (hit && t < closest.t) {
+					closest.t = t;
+					closest.normal = safeNormalize(normal);
+					closest.primitiveId = i;
+					closest.type = PRIM_TYPE_CYLINDER;
+				}
+			}
+
+			for (int i = 0; i < circleCount; ++i) {
+				int vecIndex = (analyticBaseCircle + i) * 3;
+				if (vecIndex + 2 >= analyticVec4Count) { break; }
+				debugSample.primitiveTests += 1u;
+				vec4 c0 = analyticPrimitives[vecIndex + 0];
+				vec4 c1 = analyticPrimitives[vecIndex + 1];
+				vec4 c2 = analyticPrimitives[vecIndex + 2];
+				float t;
+				vec3 normal;
+				bool hit = intersect_circle(
+					cameraPos, nearPlane, rayDir, farPlane,
+					c0.xyz, c1.xyz, c2.xyz, c0.w,
+					t, normal
+				);
+				if (hit && t < closest.t) {
+					closest.t = t;
+					closest.normal = safeNormalize(normal);
+					closest.primitiveId = i;
+					closest.type = PRIM_TYPE_CIRCLE;
+				}
+			}
+
+			for (int i = 0; i < ellipseCount; ++i) {
+				int vecIndex = (analyticBaseEllipse + i) * 3;
+				if (vecIndex + 2 >= analyticVec4Count) { break; }
+				debugSample.primitiveTests += 1u;
+				vec4 c0 = analyticPrimitives[vecIndex + 0];
+				vec4 c1 = analyticPrimitives[vecIndex + 1];
+				vec4 c2 = analyticPrimitives[vecIndex + 2];
+				float t;
+				vec3 normal;
+				bool hit = intersect_ellipse(
+					cameraPos, nearPlane, rayDir, farPlane,
+					c0.xyz, c1.xyz, c2.xyz,
+					c0.w, c1.w,
+					t, normal
+				);
+				if (hit && t < closest.t) {
+					closest.t = t;
+					closest.normal = safeNormalize(normal);
+					closest.primitiveId = i;
+					closest.type = PRIM_TYPE_ELLIPSE;
+				}
+			}
+
+			for (int i = 0; i < coneCount; ++i) {
+				int vecIndex = (analyticBaseCone + i) * 3;
+				if (vecIndex + 2 >= analyticVec4Count) { break; }
+				debugSample.primitiveTests += 1u;
+				vec4 c0 = analyticPrimitives[vecIndex + 0];
+				vec4 c1 = analyticPrimitives[vecIndex + 1];
+				vec4 c2 = analyticPrimitives[vecIndex + 2];
+				vec3 xdir = normalize(c1.xyz);
+				vec3 ydir = normalize(c2.xyz);
+				vec3 axis = normalize(cross(xdir, ydir));
+				float t;
+				vec3 normal;
+				bool hit = intersect_cone_open(
+					cameraPos, nearPlane, rayDir, farPlane,
+					c0.xyz, axis, c1.w, c0.w,
+					t, normal
+				);
+				if (hit && t < closest.t) {
+					closest.t = t;
+					closest.normal = safeNormalize(normal);
+					closest.primitiveId = i;
+					closest.type = PRIM_TYPE_CONE;
+				}
+			}
+
+			for (int i = 0; i < lineCount; ++i) {
+				int vecIndex = (analyticBaseLine + i) * 3;
+				if (vecIndex + 1 >= analyticVec4Count) { break; }
+				debugSample.primitiveTests += 1u;
+				vec4 c0 = analyticPrimitives[vecIndex + 0];
+				vec4 c1 = analyticPrimitives[vecIndex + 1];
+				float radius = max(c0.w, 1e-4);
+				float t;
+				vec3 normal;
+				bool hit = intersect_line_segment(
+					cameraPos, nearPlane, rayDir, farPlane,
+					c0.xyz, c1.xyz, radius,
+					t, normal
+				);
+				if (hit && t < closest.t) {
+					closest.t = t;
+					closest.normal = safeNormalize(normal);
+					closest.primitiveId = i;
+					closest.type = PRIM_TYPE_LINE;
+				}
+			}
+
+			for (int i = 0; i < torusCount; ++i) {
+				int vecIndex = (analyticBaseTorus + i) * 3;
+				if (vecIndex + 2 >= analyticVec4Count) { break; }
+				debugSample.primitiveTests += 1u;
+				vec4 c0 = analyticPrimitives[vecIndex + 0];
+				vec4 c1 = analyticPrimitives[vecIndex + 1];
+				vec4 c2 = analyticPrimitives[vecIndex + 2];
+				float angleDeg = c2.w;
+				float t;
+				vec3 normal;
+				bool hit;
+				if (angleDeg >= 0.0 && angleDeg < 359.5) {
+					hit = intersect_torus_wedge(
+						cameraPos, nearPlane, rayDir, farPlane,
+						c0.xyz, c1.xyz, c2.xyz, c0.w, c1.w, angleDeg,
+						t, normal
+					);
+				} else {
+					hit = intersect_torus(
+						cameraPos, nearPlane, rayDir, farPlane,
+						c0.xyz, c1.xyz, c2.xyz, c0.w, c1.w,
+						t, normal
+					);
+				}
+				if (hit && t < closest.t) {
+					closest.t = t;
+					closest.normal = safeNormalize(normal);
+					closest.primitiveId = i;
+					closest.type = PRIM_TYPE_TORUS;
+				}
+			}
+
+			for (int i = 0; i < planeCount; ++i) {
+				int vecIndex = (analyticBasePlane + i) * 3;
+				if (vecIndex + 2 >= analyticVec4Count) { break; }
+				debugSample.primitiveTests += 1u;
+				vec4 c0 = analyticPrimitives[vecIndex + 0];
+				vec4 c1 = analyticPrimitives[vecIndex + 1];
+				vec4 c2 = analyticPrimitives[vecIndex + 2];
+				float t;
+				vec3 normal;
+				bool hit = intersect_plane_rect(
+					cameraPos, nearPlane, rayDir, farPlane,
+					c0.xyz, c1.xyz, c2.xyz,
+					c0.w, c1.w,
+					t, normal
+				);
+				if (hit && t < closest.t) {
+					if (dot(normal, rayDir) > 0.0) {
+						normal = -normal;
+					}
+					closest.t = t;
+					closest.normal = safeNormalize(normal);
+					closest.primitiveId = i;
+					closest.type = PRIM_TYPE_PLANE;
+				}
+			}
+
+#if ENABLE_BEZIER_PATCHES
+			for (int i = 0; i < bezierCount; ++i) {
+				if (bezierVec4Count < int(BEZIER_VEC4_PER_PATCH)) {
+					break;
+				}
+				debugSample.primitiveTests += 1u;
+				float tHit;
+				vec2 uvHit;
+				vec3 normal;
+				if (intersectBezierPatch(cameraPos, nearPlane, rayDir, farPlane, i, bezierVec4Count, pixelWorldSlope, tHit, uvHit, normal, debugSample) && tHit < closest.t) {
+					if (dot(normal, rayDir) > 0.0) {
+						normal = -normal;
+					}
+					closest.t = tHit;
+					closest.normal = normal;
+					closest.primitiveId = i;
+					closest.type = PRIM_TYPE_BEZIER_PATCH;
+				}
+			}
+#endif
+		}
+
+		vec3 color;
+		if (closest.primitiveId >= 0) {
+			vec3 hitPos = cameraPos + rayDir * closest.t;
+			vec3 viewDir = normalize(cameraPos - hitPos);
+			vec3 normal = safeNormalize(closest.normal);
+			color = shade(normal, viewDir, closest.type, closest.primitiveId);
+		} else {
+			vec3 skyBottom = vec3(1.0, 1.0, 1.0);
+			vec3 skyTop = vec3(0.5, 0.7, 1.0);
+			float t = clamp(0.5 * (rayDir.y + 1.0), 0.0, 1.0);
+			color = mix(skyBottom, skyTop, t);
+		}
+
+		imageStore(outputImage, storeCoord, vec4(color, 1.0));
+	}
+
+	sharedDebugSamples[gl_LocalInvocationIndex] = debugSample;
+	barrier();
+
+	if (debugTelemetryEnabled && gl_LocalInvocationIndex == 0u) {
+		DebugSample total = makeDebugSample();
+		for (uint i = 0u; i < WORKGROUP_INVOCATIONS; ++i) {
+			accumulateDebugSample(total, sharedDebugSamples[i]);
+		}
+		uint groupsX = (widthU + gl_WorkGroupSize.x - 1u) / gl_WorkGroupSize.x;
+		uint groupsY = (heightU + gl_WorkGroupSize.y - 1u) / gl_WorkGroupSize.y;
+		groupsX = max(groupsX, 1u);
+		groupsY = max(groupsY, 1u);
+		uint groupIndex = gl_WorkGroupID.y * groupsX + gl_WorkGroupID.x;
+		uint baseIndexUnsigned = groupIndex * DEBUG_COUNTER_STRIDE;
+		uint endIndexUnsigned = baseIndexUnsigned + DEBUG_COUNTER_STRIDE;
+		int totalLength = debugCounters.counters.length();
+		if (totalLength >= int(endIndexUnsigned)) {
+			int baseIndex = int(baseIndexUnsigned);
+			debugCounters.counters[baseIndex + 0] = total.rayCount;
+			debugCounters.counters[baseIndex + 1] = total.nodesTraversed;
+			debugCounters.counters[baseIndex + 2] = total.leafTests;
+			debugCounters.counters[baseIndex + 3] = total.primitiveTests;
+			debugCounters.counters[baseIndex + 4] = total.bezierCandidateLeaves;
+			debugCounters.counters[baseIndex + 5] = total.bezierNewtonIterations;
+			debugCounters.counters[baseIndex + 6] = total.bezierHits;
+			debugCounters.counters[baseIndex + 7] = total.bezierMisses;
+			debugCounters.counters[baseIndex + 8] = total.bezierQueueOverflows;
+			debugCounters.counters[baseIndex + 9] = total.bezierMaxQueue;
+			debugCounters.counters[baseIndex + 10] = total.reservedCounter0;
+			debugCounters.counters[baseIndex + 11] = total.reservedCounter1;
 		}
 	}
-
-	vec3 color;
-	if (closest.primitiveId >= 0) {
-		vec3 hitPos = cameraPos + rayDir * closest.t;
-		vec3 viewDir = normalize(cameraPos - hitPos);
-		vec3 normal = safeNormalize(closest.normal);
-		color = shade(normal, viewDir, closest.type, closest.primitiveId);
-	} else {
-		vec3 skyBottom = vec3(1.0, 1.0, 1.0);
-		vec3 skyTop = vec3(0.5, 0.7, 1.0);
-		float t = clamp(0.5 * (rayDir.y + 1.0), 0.0, 1.0);
-		color = mix(skyBottom, skyTop, t);
-	}
-
-	imageStore(outputImage, storeCoord, vec4(color, 1.0));
 }
