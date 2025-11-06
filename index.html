@@ -7,11 +7,36 @@
     <style>
       html, body { margin: 0; padding: 0; background: #111; }
       canvas { display: block; margin: 0 auto; background: #000; image-rendering: pixelated; }
+      #dtds-controls {
+        position: fixed;
+        top: 16px;
+        left: 16px;
+        padding: 12px 14px;
+        border-radius: 10px;
+        background: rgba(20, 20, 24, 0.8);
+        color: #f4f4f8;
+        font-family: 'Segoe UI', 'Pretendard', system-ui, -apple-system, sans-serif;
+        font-size: 14px;
+        line-height: 1.35;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        backdrop-filter: blur(10px);
+      }
+      #dtds-controls label { display: flex; flex-direction: column; gap: 6px; cursor: pointer; }
+      #dtds-controls span { font-weight: 600; opacity: 0.9; }
+      #dtdsPicker { color: #f4f4f8; font-size: 13px; }
     </style>
   </head>
   <body>
     <!-- Interactive canvas: data-autointeractive triggers auto start (added in index.ts) -->
     <canvas id="gfx" width="1920" height="1080" data-autointeractive></canvas>
+
+    <div id="dtds-controls">
+      <label>
+        <span>Load DTDS Scene</span>
+        <input type="file" id="dtdsPicker" accept=".bin" />
+      </label>
+    </div>
 
     <!-- Load bundle; auto interactive start handled in src/index.ts when data-autointeractive present -->
     <script src="./dist/index.js"></script>

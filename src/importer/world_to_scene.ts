@@ -1,4 +1,5 @@
-import type { WorldPrimitives, WPCircle, WPCone, WPCylinder, WPEllipse, WPLine, WPPlane, WPSphere, WPTorus } from '../sample/importer';
+import { attachDTDSLoader } from './dtds_importer';
+import type { WorldPrimitives, WPCircle, WPCone, WPCylinder, WPEllipse, WPLine, WPPlane, WPSphere, WPTorus } from './dtds_importer';
 import type {
 	BezierPatchInstance,
 	CircleInstance,
@@ -349,4 +350,104 @@ export function worldPrimitivesToFallbackScene(
 	};
 }
 
-export type { WorldPrimitives } from '../sample/importer';
+export interface SceneSettable {
+	setScene(scene: FallbackSceneDescriptor): Promise<void>;
+}
+
+export interface SceneApplyContext {
+	world: WorldPrimitives;
+	fallbackScene: FallbackSceneDescriptor;
+	file?: File;
+}
+
+export interface SceneApplyOptions extends ImporterConversionOptions {
+	beforeSetScene?: (context: SceneApplyContext) => void | Promise<void>;
+	afterSetScene?: (context: SceneApplyContext) => void | Promise<void>;
+}
+
+export interface SceneLoaderErrorContext {
+	world: WorldPrimitives;
+	file: File;
+	fallbackScene?: FallbackSceneDescriptor;
+}
+
+export interface AttachDTDSSceneLoaderOptions extends SceneApplyOptions {
+	loader?: {
+		log?: boolean;
+		samplePerKind?: number;
+		collapsed?: boolean;
+	};
+	onError?: (error: unknown, context: SceneLoaderErrorContext) => void | Promise<void>;
+}
+
+export async function applyWorldPrimitivesToScene(
+	world: WorldPrimitives,
+	sceneHandle: SceneSettable,
+	options: SceneApplyOptions = {},
+	contextOverrides: Partial<SceneApplyContext> = {}
+): Promise<FallbackSceneDescriptor> {
+	const { beforeSetScene, afterSetScene } = options;
+	const conversionOptions: ImporterConversionOptions = {
+		planeSizeFallback: options.planeSizeFallback,
+		lineRadiusFallback: options.lineRadiusFallback,
+		maxPerType: options.maxPerType,
+	};
+	const fallbackScene =
+		contextOverrides.fallbackScene ?? worldPrimitivesToFallbackScene(world, conversionOptions);
+	const context: SceneApplyContext = {
+		world,
+		fallbackScene,
+		file: contextOverrides.file ?? undefined,
+	};
+	if (beforeSetScene) {
+		await beforeSetScene(context);
+	}
+	await sceneHandle.setScene(fallbackScene);
+	if (afterSetScene) {
+		await afterSetScene(context);
+	}
+	return fallbackScene;
+}
+
+export function attachDTDSSceneLoader(
+	input: string | HTMLInputElement,
+	sceneHandle: SceneSettable,
+	options: AttachDTDSSceneLoaderOptions = {}
+): void {
+	const { loader, onError, ...applyOptions } = options;
+	attachDTDSLoader(
+		input,
+		(world, file) => {
+			void (async () => {
+				let fallbackScene: FallbackSceneDescriptor | undefined;
+				try {
+					const conversionOptions: ImporterConversionOptions = {
+						planeSizeFallback: applyOptions.planeSizeFallback,
+						lineRadiusFallback: applyOptions.lineRadiusFallback,
+						maxPerType: applyOptions.maxPerType,
+					};
+					fallbackScene = worldPrimitivesToFallbackScene(world, conversionOptions);
+				} catch (error) {
+					if (onError) {
+						await onError(error, { world, file, fallbackScene });
+					} else {
+						console.error('[WebRTX] Failed to convert DTDS world to fallback scene.', error);
+					}
+					return;
+				}
+				try {
+					await applyWorldPrimitivesToScene(world, sceneHandle, applyOptions, { file, fallbackScene });
+				} catch (error) {
+					if (onError) {
+						await onError(error, { world, file, fallbackScene });
+					} else {
+						console.error('[WebRTX] Failed to apply DTDS scene to renderer.', error);
+					}
+				}
+			})();
+		},
+		loader
+	);
+}
+
+export type { WorldPrimitives } from './dtds_importer';

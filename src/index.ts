@@ -5,6 +5,37 @@ export { initBvhWasm } from './wasm_bvh_builder';
 export { runMinimalScene, runSphereScene, runPlaneScene, runRayTracingScene } from './scene';
 export { Camera } from './camera';
 export { Controls } from './controls';
+import { attachDTDSSceneLoader, SceneSettable } from './importer/world_to_scene';
+
+type SceneHandleWithRender = SceneSettable & { render?: () => Promise<void> };
+
+const DTDS_INPUT_ID = 'dtdsPicker';
+const attachedSceneHandles = new WeakSet<SceneHandleWithRender>();
+
+function tryAttachDtdsLoader(sceneHandle: SceneHandleWithRender): void {
+	if (typeof document === 'undefined' || !sceneHandle) {
+		return;
+	}
+	if (attachedSceneHandles.has(sceneHandle)) {
+		return;
+	}
+	const input = document.getElementById(DTDS_INPUT_ID) as HTMLInputElement | null;
+	if (!input) {
+		return;
+	}
+	attachDTDSSceneLoader(input, sceneHandle, {
+		afterSetScene: async () => {
+			if (typeof sceneHandle.render === 'function') {
+				try {
+					await sceneHandle.render();
+				} catch (renderError) {
+					console.warn('[WebRTX] Failed to render DTDS scene after import.', renderError);
+				}
+			}
+		},
+	});
+	attachedSceneHandles.add(sceneHandle);
+}
 
 // Optional global helper for manual console start if user loaded only dist bundle
 if (typeof window !== 'undefined') {
@@ -19,6 +50,7 @@ if (typeof window !== 'undefined') {
 			const { runInteractiveScene } = await import('./interactive');
 			const res = await runInteractiveScene(canvasId, opts);
 			(window as any).interactive = res;
+			tryAttachDtdsLoader(res as SceneHandleWithRender);
 			console.log('[WebRTX] Interactive scene started. Access via window.interactive');
 			return res;
 		} finally {
@@ -58,10 +90,11 @@ if (typeof window !== 'undefined') {
 			if (!(window as any).interactive) {
 				console.log('[WebRTX] Auto launching interactive mode');
 					try {
-							// Defer a microtask to ensure all modules/patches finished evaluating
-							await Promise.resolve();
-							await (window as any).startInteractive(canvas.id || 'gfx');
-						} catch (e) { console.warn('[WebRTX] Auto interactive failed', e); }
+						// Defer a microtask to ensure all modules/patches finished evaluating
+						await Promise.resolve();
+						const handle = await (window as any).startInteractive(canvas.id || 'gfx');
+						tryAttachDtdsLoader(handle as SceneHandleWithRender);
+					} catch (e) { console.warn('[WebRTX] Auto interactive failed', e); }
 			}
 		}
 	});

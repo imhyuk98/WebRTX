@@ -13,6 +13,7 @@ export type {
 	WPEllipse,
 	WPLine,
 	WPCone,
+	WPTorus,
 	WPEllipseCurve,
 	WPCircleCurve,
 	WPHermiteSpline,

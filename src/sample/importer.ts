@@ -199,8 +199,9 @@ function applyRotation(dir: Vec3, tr: TransformRecord): Vec3 {
     dir[0]*tr.bx[2] + dir[1]*tr.by[2] + dir[2]*tr.bz[2],
   ];
 }
-// Z-up -> Y-up: (x, y, z) -> (x, z, -y)
-function fixCoordSystem(p: Vec3): Vec3 { const [ox, oy, oz] = p; return [ox, -oz, oy]; }
+// Z-up -> Y-up: rotate -90° around X so +Z becomes +Y.
+// Mapping: (x, y, z) -> (x, z, -y)
+function fixCoordSystem(p: Vec3): Vec3 { const [ox, oy, oz] = p; return [ox, oz, -oy]; }
 function maybeFix(p: Vec3): Vec3 { return APPLY_ZUP_TO_YUP ? fixCoordSystem(p) : p; }
 
 function isValidBasis(bx: Vec3, by: Vec3, bz: Vec3): boolean {
