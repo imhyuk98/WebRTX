@@ -39,11 +39,40 @@ async function loadNaga(): Promise<NagaModule> {
 	return nagaInstance;
 }
 
-export async function compileGlslStageToWgsl(source: string, stage: ShaderStage): Promise<string> {
+type GlslDefineValue = string | number | boolean;
+
+function applyDefinesToGlsl(source: string, defines?: Record<string, GlslDefineValue>): string {
+	if (!defines || Object.keys(defines).length === 0) {
+		return source;
+	}
+	const defineLines = Object.entries(defines).map(([key, value]) => {
+		if (value === true) {
+			return `#define ${key} 1`;
+		}
+		if (value === false) {
+			return `#define ${key} 0`;
+		}
+		return `#define ${key} ${value}`;
+	});
+	const lines = source.split('\n');
+	let insertIndex = 0;
+	if (lines.length > 0 && lines[0].startsWith('#version')) {
+		insertIndex = 1;
+	}
+	lines.splice(insertIndex, 0, ...defineLines);
+	return lines.join('\n');
+}
+
+export async function compileGlslStageToWgsl(
+	source: string,
+	stage: ShaderStage,
+	defines?: Record<string, GlslDefineValue>,
+): Promise<string> {
 	const glslang = await loadGlslang();
+	const decoratedSource = applyDefinesToGlsl(source, defines);
 	let spirv: Uint32Array;
 	try {
-		spirv = glslang.compileGLSL(source, stage, false);
+		spirv = glslang.compileGLSL(decoratedSource, stage, false);
 	} catch (error) {
 		const reason = error instanceof Error ? error.message : String(error);
 		throw new Error(`[WebRTX][Fallback] GLSL compilation failed for ${stage} stage: ${reason}`);

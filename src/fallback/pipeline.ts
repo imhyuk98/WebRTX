@@ -137,8 +137,6 @@ const asyncNoop = async () => {};
 let debugPrimitiveSnapshotLogged = false;
 let debugBvhSnapshotLogged = false;
 
-let cachedFallbackShaderPromise: Promise<CompiledFallbackShaders> | null = null;
-
 function resolveGlslModule(module: unknown, label: string): string {
 	if (typeof module === 'string') {
 		return module;
@@ -154,28 +152,43 @@ const fallbackVertexGlsl = resolveGlslModule(fallbackVertexModule, 'vertex');
 const fallbackFragmentGlsl = resolveGlslModule(fallbackFragmentModule, 'fragment');
 const fallbackComputeGlsl = resolveGlslModule(fallbackComputeModule, 'compute');
 
-async function getFallbackShaderWgsl(): Promise<CompiledFallbackShaders> {
-	if (!cachedFallbackShaderPromise) {
-		if (isWebrtxDebugLoggingEnabled()) {
-			debugInfo('[WebRTX] fallback shader sources', {
-				vertex: typeof fallbackVertexGlsl,
-				fragment: typeof fallbackFragmentGlsl,
-				compute: typeof fallbackComputeGlsl,
-				vertexLength: fallbackVertexGlsl?.length,
-				fragmentLength: fallbackFragmentGlsl?.length,
-				computeLength: fallbackComputeGlsl?.length,
-			});
-		}
-		cachedFallbackShaderPromise = (async () => {
-			const [vertex, fragment, compute] = await Promise.all([
-				compileGlslStageToWgsl(fallbackVertexGlsl, 'vertex'),
-				compileGlslStageToWgsl(fallbackFragmentGlsl, 'fragment'),
-				compileGlslStageToWgsl(fallbackComputeGlsl, 'compute'),
-			]);
-			return { vertex, fragment, compute };
-		})();
+let cachedVertexShaderPromise: Promise<string> | null = null;
+let cachedFragmentShaderPromise: Promise<string> | null = null;
+const cachedComputeShaderPromises = new Map<string, Promise<string>>();
+
+interface FallbackShaderOptions {
+	enableBezier: boolean;
+}
+
+async function getFallbackShaderWgsl(options: FallbackShaderOptions): Promise<CompiledFallbackShaders> {
+	if (isWebrtxDebugLoggingEnabled()) {
+		debugInfo('[WebRTX] fallback shader sources request', {
+			enableBezier: options.enableBezier,
+			vertexLength: fallbackVertexGlsl?.length,
+			fragmentLength: fallbackFragmentGlsl?.length,
+			computeLength: fallbackComputeGlsl?.length,
+		});
 	}
-	return cachedFallbackShaderPromise;
+	if (!cachedVertexShaderPromise) {
+		cachedVertexShaderPromise = compileGlslStageToWgsl(fallbackVertexGlsl, 'vertex');
+	}
+	if (!cachedFragmentShaderPromise) {
+		cachedFragmentShaderPromise = compileGlslStageToWgsl(fallbackFragmentGlsl, 'fragment');
+	}
+	const computeKey = options.enableBezier ? 'bezier-on' : 'bezier-off';
+	let computePromise = cachedComputeShaderPromises.get(computeKey);
+	if (!computePromise) {
+		computePromise = compileGlslStageToWgsl(fallbackComputeGlsl, 'compute', {
+			ENABLE_BEZIER_PATCHES: options.enableBezier ? 1 : 0,
+		});
+		cachedComputeShaderPromises.set(computeKey, computePromise);
+	}
+	const [vertex, fragment, compute] = await Promise.all([
+		cachedVertexShaderPromise,
+		cachedFragmentShaderPromise,
+		computePromise,
+	]);
+	return { vertex, fragment, compute };
 }
 
 function isArrayBufferLikeValue(value: unknown): value is ArrayBufferLike {
@@ -606,6 +619,8 @@ export async function runFallbackPipeline(options: FallbackPipelineOptions): Pro
 		planes: scene.planes.map((p) => ({ ...p })),
 		bezierPatches: scene.bezierPatches?.map(cloneBezierPatch) ?? [],
 	};
+	let vertexModule: GPUShaderModule | null = null;
+	let fragmentModule: GPUShaderModule | null = null;
 	let computePipeline: GPUComputePipeline | null = null;
 	let renderPipeline: GPURenderPipeline | null = null;
 	let computeBindGroup: GPUBindGroup | null = null;
@@ -621,6 +636,7 @@ export async function runFallbackPipeline(options: FallbackPipelineOptions): Pro
 	let debugCounterGroupCount = 1;
 	let pendingDebugReadback: Promise<void> | null = null;
 	let lastDebugLogTime = 0;
+	let computeShaderBezierEnabled = false;
 
 	function isZeroVec(v: Vec3): boolean {
 		return Math.abs(v[0]) < 1e-5 && Math.abs(v[1]) < 1e-5 && Math.abs(v[2]) < 1e-5;
@@ -1628,6 +1644,39 @@ export async function runFallbackPipeline(options: FallbackPipelineOptions): Pro
 		};
 	}
 
+	async function ensurePipelines(enableBezier: boolean): Promise<void> {
+		const needsNewCompute = !computePipeline || computeShaderBezierEnabled !== enableBezier;
+		const needsRender = !renderPipeline;
+		if (!needsNewCompute && !needsRender) {
+			return;
+		}
+		const shaders = await getFallbackShaderWgsl({ enableBezier });
+		if (!vertexModule) {
+			vertexModule = device.createShaderModule({ code: shaders.vertex });
+		}
+		if (!fragmentModule) {
+			fragmentModule = device.createShaderModule({ code: shaders.fragment });
+		}
+		if (needsNewCompute) {
+			const computeModule = device.createShaderModule({ code: shaders.compute });
+			computePipeline = device.createComputePipeline({
+				layout: 'auto',
+				compute: { module: computeModule, entryPoint: 'main' },
+			});
+			console.info('[Fallback] Compute shader rebuild – active shader set:', enableBezier ? 'bezier' : 'no-bezier');
+			computeShaderBezierEnabled = enableBezier;
+			computeBindGroup = null;
+		}
+		if (!renderPipeline && vertexModule && fragmentModule) {
+			renderPipeline = device.createRenderPipeline({
+				layout: 'auto',
+				vertex: { module: vertexModule, entryPoint: 'main' },
+				fragment: { module: fragmentModule, entryPoint: 'main', targets: [{ format }] },
+				primitive: { topology: 'triangle-list' },
+			});
+		}
+	}
+
 	async function updateAllPrimitives(prims: ScenePrimitiveState): Promise<void> {
 		const accel = await buildPrimitiveAcceleration(prims, bezierUploadsEnabled);
 		primitiveCountValue = accel.primitiveCount;
@@ -1645,6 +1694,8 @@ export async function runFallbackPipeline(options: FallbackPipelineOptions): Pro
 			accel.counts.plane;
 		currentAnalyticPrimitiveCount = analyticCount;
 		currentBezierPatchCount = accel.counts.bezier;
+		const bezierShaderNeeded = bezierUploadsEnabled && accel.counts.bezier > 0;
+		await ensurePipelines(bezierShaderNeeded);
 
 		let resized = false;
 		resized = ensureFloatStorageBuffer(sphereStorage, SPHERE_FLOATS, accel.counts.sphere) || resized;
@@ -1754,23 +1805,6 @@ export async function runFallbackPipeline(options: FallbackPipelineOptions): Pro
 	configureCanvas(logicalWidth, logicalHeight, dpr);
 
 	const fpsOverlay = createFpsOverlay(canvas);
-
-	const fallbackShaders = await getFallbackShaderWgsl();
-	const computeModule = device.createShaderModule({ code: fallbackShaders.compute });
-	const vertexModule = device.createShaderModule({ code: fallbackShaders.vertex });
-	const fragmentModule = device.createShaderModule({ code: fallbackShaders.fragment });
-
-	computePipeline = device.createComputePipeline({
-		layout: 'auto',
-		compute: { module: computeModule, entryPoint: 'main' },
-	});
-
-	renderPipeline = device.createRenderPipeline({
-		layout: 'auto',
-		vertex: { module: vertexModule, entryPoint: 'main' },
-		fragment: { module: fragmentModule, entryPoint: 'main', targets: [{ format }] },
-		primitive: { topology: 'triangle-list' },
-	});
 
 	if (scene.sphereBvh) {
 		debugWarn('[WebRTX] Prebuilt sphere BVH ignored by fallback renderer; rebuilding with WebRTX BVH');

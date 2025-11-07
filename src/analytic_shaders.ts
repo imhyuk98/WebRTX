@@ -65,7 +65,8 @@ layout(set=0,binding=14,std430) buffer BezierPatches { vec4 data[]; } sBezier;
 hitAttributeEXT vec2 attrUv;
 
 const uint BEZIER_VEC4_PER_PATCH = 18u;
-const int BEZIER_MAX_QUEUE = 48;
+const int BEZIER_MAX_DEPTH_LIMIT = 16;
+const int BEZIER_STACK_CAP = 64;
 
 struct BezierPatchData {
   vec4 cp[16];
@@ -73,18 +74,6 @@ struct BezierPatchData {
   vec3 boundsMax;
   float maxDepth;
   float pixelEpsilon;
-};
-
-struct BezierNode {
-  vec4 cp[16];
-  vec3 boundsMin;
-  vec3 boundsMax;
-  float u0;
-  float v0;
-  float u1;
-  float v1;
-  float tEnter;
-  int depth;
 };
 
 vec3 makeSafeInverse(vec3 dir){
@@ -237,6 +226,34 @@ void computeBezierBounds(in vec4 cp[16], out vec3 bmin, out vec3 bmax){
   }
 }
 
+void copyBezierPatch(in vec4 src[16], out vec4 dst[16]){
+  for(int i=0;i<16;++i){
+    dst[i] = src[i];
+  }
+}
+
+void selectBezierChild(in vec4 src[16], uint childIndex, out vec4 dst[16]){
+  vec4 c0[16];
+  vec4 c1[16];
+  vec4 c2[16];
+  vec4 c3[16];
+  subdivideBezierPatch(src, c0, c1, c2, c3);
+  if(childIndex == 0u){ copyBezierPatch(c0, dst); }
+  else if(childIndex == 1u){ copyBezierPatch(c1, dst); }
+  else if(childIndex == 2u){ copyBezierPatch(c2, dst); }
+  else { copyBezierPatch(c3, dst); }
+}
+
+void loadBezierSubPatch(BezierPatchData patch, uint pathBits, int depth, out vec4 dst[16]){
+  copyBezierPatch(patch.cp, dst);
+  for(int level=0; level<depth; ++level){
+    uint child = (pathBits >> (uint(level) * 2u)) & 3u;
+    vec4 tmp[16];
+    selectBezierChild(dst, child, tmp);
+    copyBezierPatch(tmp, dst);
+  }
+}
+
 bool newtonRefine(in vec4 cp[16], vec3 rayOrigin, vec3 rayDir, float tMin, float tMax, inout float u, inout float v, inout float t){
   const int MAX_IT = 8;
   const float EPS_F = 1e-4;
@@ -296,54 +313,64 @@ bool intersectBezierPatch(vec3 rayOrigin, float rayTMin, vec3 rayDir, float rayT
   float bestT = min(rayTMax, exitT);
   vec2 bestUV = vec2(0.0);
   float pixelEps = max(patch.pixelEpsilon, 1e-4);
-  int maxDepth = clamp(int(floor(patch.maxDepth + 0.5)), 1, 16);
+  int maxDepth = clamp(int(floor(patch.maxDepth + 0.5)), 1, BEZIER_MAX_DEPTH_LIMIT);
   vec3 rootExtents = patch.boundsMax - patch.boundsMin;
   float rootMaxEdge = max(max(rootExtents.x, rootExtents.y), rootExtents.z);
   bool hasHit = false;
   float depthEdgeTarget = rootMaxEdge * exp2(-float(maxDepth));
   float baseLeafEdge = max(pixelEps, depthEdgeTarget);
-  BezierNode queue[BEZIER_MAX_QUEUE];
-  int size = 0;
-  BezierNode root;
-  for(int i=0;i<16;++i){ root.cp[i] = patch.cp[i]; }
-  root.boundsMin = patch.boundsMin;
-  root.boundsMax = patch.boundsMax;
-  root.u0 = 0.0;
-  root.v0 = 0.0;
-  root.u1 = 1.0;
-  root.v1 = 1.0;
-  root.tEnter = enterT;
-  root.depth = 0;
-  queue[size++] = root;
-  while(size > 0){
-    int bestIdx = 0;
-    float bestEnter = queue[0].tEnter;
-    for(int i=1;i<size;++i){
-      if(queue[i].tEnter < bestEnter){
-        bestEnter = queue[i].tEnter;
-        bestIdx = i;
-      }
-    }
-    BezierNode node = queue[bestIdx];
-    queue[bestIdx] = queue[--size];
-    if(node.tEnter >= bestT){
+  int stackSize = 0;
+  uint stackPath[BEZIER_STACK_CAP];
+  int stackDepth[BEZIER_STACK_CAP];
+  vec3 stackBoundsMin[BEZIER_STACK_CAP];
+  vec3 stackBoundsMax[BEZIER_STACK_CAP];
+  float stackU0[BEZIER_STACK_CAP];
+  float stackV0[BEZIER_STACK_CAP];
+  float stackU1[BEZIER_STACK_CAP];
+  float stackV1[BEZIER_STACK_CAP];
+  float stackTEnter[BEZIER_STACK_CAP];
+  // push root
+  stackPath[stackSize] = 0u;
+  stackDepth[stackSize] = 0;
+  stackBoundsMin[stackSize] = patch.boundsMin;
+  stackBoundsMax[stackSize] = patch.boundsMax;
+  stackU0[stackSize] = 0.0;
+  stackV0[stackSize] = 0.0;
+  stackU1[stackSize] = 1.0;
+  stackV1[stackSize] = 1.0;
+  stackTEnter[stackSize] = enterT;
+  stackSize++;
+  while(stackSize > 0){
+    stackSize--;
+    uint nodePath = stackPath[stackSize];
+    int nodeDepth = stackDepth[stackSize];
+    vec3 nodeBMin = stackBoundsMin[stackSize];
+    vec3 nodeBMax = stackBoundsMax[stackSize];
+    float nodeU0 = stackU0[stackSize];
+    float nodeV0 = stackV0[stackSize];
+    float nodeU1 = stackU1[stackSize];
+    float nodeV1 = stackV1[stackSize];
+    float nodeTEnter = stackTEnter[stackSize];
+    if(nodeTEnter >= bestT){
       continue;
     }
-    vec3 extents = node.boundsMax - node.boundsMin;
+    vec4 nodeCp[16];
+    loadBezierSubPatch(patch, nodePath, nodeDepth, nodeCp);
+    vec3 extents = nodeBMax - nodeBMin;
     float maxEdge = max(max(extents.x, extents.y), extents.z);
-    float distanceEstimate = max(max(node.tEnter, rayTMin), 0.0);
+    float distanceEstimate = max(max(nodeTEnter, rayTMin), 0.0);
     float screenLeafEdge = max(distanceEstimate * pixelWorldSlope, 1e-4);
     float nodeLeafEdge = max(baseLeafEdge, screenLeafEdge);
-  bool leaf = (maxEdge <= nodeLeafEdge) || (node.depth >= maxDepth);
+    bool leaf = (maxEdge <= nodeLeafEdge) || (nodeDepth >= maxDepth);
     if(leaf){
       float uLocal = 0.5;
       float vLocal = 0.5;
-      float tCandidate = clamp(node.tEnter, rayTMin, bestT);
+      float tCandidate = clamp(nodeTEnter, rayTMin, bestT);
       float tUpper = min(bestT, rayTMax);
-      if(newtonRefine(node.cp, rayOrigin, rayDir, rayTMin, tUpper, uLocal, vLocal, tCandidate)){
+      if(newtonRefine(nodeCp, rayOrigin, rayDir, rayTMin, tUpper, uLocal, vLocal, tCandidate)){
         if(tCandidate >= rayTMin && tCandidate < bestT && tCandidate <= rayTMax){
-          float uGlobal = mix(node.u0, node.u1, clamp(uLocal, 0.0, 1.0));
-          float vGlobal = mix(node.v0, node.v1, clamp(vLocal, 0.0, 1.0));
+          float uGlobal = mix(nodeU0, nodeU1, clamp(uLocal, 0.0, 1.0));
+          float vGlobal = mix(nodeV0, nodeV1, clamp(vLocal, 0.0, 1.0));
           bestT = tCandidate;
           bestUV = vec2(uGlobal, vGlobal);
           hasHit = true;
@@ -355,61 +382,54 @@ bool intersectBezierPatch(vec3 rayOrigin, float rayTMin, vec3 rayDir, float rayT
     vec4 child1[16];
     vec4 child2[16];
     vec4 child3[16];
-    subdivideBezierPatch(node.cp, child0, child1, child2, child3);
-    float uMid = 0.5 * (node.u0 + node.u1);
-    float vMid = 0.5 * (node.v0 + node.v1);
+    subdivideBezierPatch(nodeCp, child0, child1, child2, child3);
+    float uMid = 0.5 * (nodeU0 + nodeU1);
+    float vMid = 0.5 * (nodeV0 + nodeV1);
     float farBound = min(bestT, rayTMax);
-
-  vec3 bmin0; vec3 bmax0; computeBezierBounds(child0, bmin0, bmax0);
-  float enter0; float exit0;
-  if(size < BEZIER_MAX_QUEUE && intersectAabbExt(bmin0, bmax0, rayOrigin, invDir, rayTMin, farBound, enter0, exit0)){
-      BezierNode child;
-      for(int k=0;k<16;++k){ child.cp[k] = child0[k]; }
-      child.boundsMin = bmin0 - vec3(1e-6);
-      child.boundsMax = bmax0 + vec3(1e-6);
-      child.depth = node.depth + 1;
-      child.u0 = node.u0; child.u1 = uMid; child.v0 = node.v0; child.v1 = vMid;
-      child.tEnter = enter0;
-      queue[size++] = child;
+    vec3 childBMin[4];
+    vec3 childBMax[4];
+    float childTEnter[4];
+    bool childValid[4];
+    uint childId[4];
+    childId[0] = 0u; childId[1] = 1u; childId[2] = 2u; childId[3] = 3u;
+    for(int c=0;c<4;++c){ childValid[c] = false; }
+    computeBezierBounds(child0, childBMin[0], childBMax[0]);
+    computeBezierBounds(child1, childBMin[1], childBMax[1]);
+    computeBezierBounds(child2, childBMin[2], childBMax[2]);
+    computeBezierBounds(child3, childBMin[3], childBMax[3]);
+    for(int c=0;c<4;++c){
+      float enterChild; float exitChild;
+      if(intersectAabbExt(childBMin[c], childBMax[c], rayOrigin, invDir, rayTMin, farBound, enterChild, exitChild)){
+        childValid[c] = true;
+        childTEnter[c] = enterChild;
+      }
     }
-
-  vec3 bmin1; vec3 bmax1; computeBezierBounds(child1, bmin1, bmax1);
-  float enter1; float exit1;
-  if(size < BEZIER_MAX_QUEUE && intersectAabbExt(bmin1, bmax1, rayOrigin, invDir, rayTMin, farBound, enter1, exit1)){
-      BezierNode child;
-      for(int k=0;k<16;++k){ child.cp[k] = child1[k]; }
-      child.boundsMin = bmin1 - vec3(1e-6);
-      child.boundsMax = bmax1 + vec3(1e-6);
-      child.depth = node.depth + 1;
-      child.u0 = uMid; child.u1 = node.u1; child.v0 = node.v0; child.v1 = vMid;
-      child.tEnter = enter1;
-      queue[size++] = child;
+    // sort children by tEnter descending so nearest processed last (LIFO stack)
+    for(int a=0;a<4;++a){
+      for(int b=a+1;b<4;++b){
+        if(childValid[a] && childValid[b] && childTEnter[a] < childTEnter[b]){
+          bool vtmp = childValid[a]; childValid[a] = childValid[b]; childValid[b] = vtmp;
+          float ttmp = childTEnter[a]; childTEnter[a] = childTEnter[b]; childTEnter[b] = ttmp;
+          vec3 bminTmp = childBMin[a]; childBMin[a] = childBMin[b]; childBMin[b] = bminTmp;
+          vec3 bmaxTmp = childBMax[a]; childBMax[a] = childBMax[b]; childBMax[b] = bmaxTmp;
+          uint idTmp = childId[a]; childId[a] = childId[b]; childId[b] = idTmp;
+        }
+      }
     }
-
-  vec3 bmin2; vec3 bmax2; computeBezierBounds(child2, bmin2, bmax2);
-  float enter2; float exit2;
-  if(size < BEZIER_MAX_QUEUE && intersectAabbExt(bmin2, bmax2, rayOrigin, invDir, rayTMin, farBound, enter2, exit2)){
-      BezierNode child;
-      for(int k=0;k<16;++k){ child.cp[k] = child2[k]; }
-      child.boundsMin = bmin2 - vec3(1e-6);
-      child.boundsMax = bmax2 + vec3(1e-6);
-      child.depth = node.depth + 1;
-      child.u0 = node.u0; child.u1 = uMid; child.v0 = vMid; child.v1 = node.v1;
-      child.tEnter = enter2;
-      queue[size++] = child;
-    }
-
-  vec3 bmin3; vec3 bmax3; computeBezierBounds(child3, bmin3, bmax3);
-  float enter3; float exit3;
-  if(size < BEZIER_MAX_QUEUE && intersectAabbExt(bmin3, bmax3, rayOrigin, invDir, rayTMin, farBound, enter3, exit3)){
-      BezierNode child;
-      for(int k=0;k<16;++k){ child.cp[k] = child3[k]; }
-      child.boundsMin = bmin3 - vec3(1e-6);
-      child.boundsMax = bmax3 + vec3(1e-6);
-      child.depth = node.depth + 1;
-      child.u0 = uMid; child.u1 = node.u1; child.v0 = vMid; child.v1 = node.v1;
-      child.tEnter = enter3;
-      queue[size++] = child;
+    for(int c=0;c<4;++c){
+      if(!childValid[c]){ continue; }
+      if(stackSize >= BEZIER_STACK_CAP){ break; }
+      uint childPath = (nodePath << 2u) | childId[c];
+      stackPath[stackSize] = childPath;
+      stackDepth[stackSize] = nodeDepth + 1;
+      stackBoundsMin[stackSize] = childBMin[c] - vec3(1e-6);
+      stackBoundsMax[stackSize] = childBMax[c] + vec3(1e-6);
+      if(childId[c] == 0u){ stackU0[stackSize] = nodeU0; stackU1[stackSize] = uMid; stackV0[stackSize] = nodeV0; stackV1[stackSize] = vMid; }
+      else if(childId[c] == 1u){ stackU0[stackSize] = uMid; stackU1[stackSize] = nodeU1; stackV0[stackSize] = nodeV0; stackV1[stackSize] = vMid; }
+      else if(childId[c] == 2u){ stackU0[stackSize] = nodeU0; stackU1[stackSize] = uMid; stackV0[stackSize] = vMid; stackV1[stackSize] = nodeV1; }
+      else { stackU0[stackSize] = uMid; stackU1[stackSize] = nodeU1; stackV0[stackSize] = vMid; stackV1[stackSize] = nodeV1; }
+      stackTEnter[stackSize] = childTEnter[c];
+      stackSize++;
     }
   }
   if(hasHit && bestT < min(rayTMax, 1e37)){

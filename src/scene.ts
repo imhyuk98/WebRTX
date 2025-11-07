@@ -2,7 +2,18 @@
 
 import { initBvhWasm } from './wasm_bvh_builder';
 import { buildAnalyticPrimitivesTLAS } from './analytic_primitives_bvh';
-import { getRayGenShader, getMissShader, getIntersectionShader, getClosestHitShader } from './analytic_shaders';
+import {
+  getRayGenShader,
+  getMissShader,
+  getIntersectionShader,
+  getClosestHitShader,
+} from './analytic_shaders';
+import {
+  getRayGenShaderNoBezier,
+  getMissShaderNoBezier,
+  getIntersectionShaderNoBezier,
+  getClosestHitShaderNoBezier,
+} from './analytic_shaders_no_bezier';
 import { runFallbackPipeline } from './fallback/pipeline';
 import { BEZIER_FLOATS, convertHermitePatchToBezier, packBezierPatchFloats } from './bezier_patch';
 import type {
@@ -317,6 +328,8 @@ async function launchFallbackRenderer(
   if (!resolvedAdapter) {
     throw new Error('No GPU adapter available for fallback renderer.');
   }
+  const overrides = (globalThis as any).__webrtxOverrides || {};
+  const allowBezierUploads = !(overrides.disableBezier === true || overrides.disableHermite === true);
   const handle = await runFallbackPipeline({
     canvasOrId,
     width,
@@ -324,6 +337,7 @@ async function launchFallbackRenderer(
     adapter: resolvedAdapter,
     device,
     scene: buildFallbackSceneDescriptor(config),
+    enableBezierUploads: allowBezierUploads,
   });
   const overrideSpheres = computeOverrideSphereInstances();
   if (overrideSpheres && overrideSpheres.length > 0) {
@@ -331,6 +345,21 @@ async function launchFallbackRenderer(
       await handle.setSpheres(overrideSpheres);
     } catch (err) {
       console.warn('[WebRTX] Failed to apply sphere overrides on fallback renderer.', err);
+    }
+  }
+  const disableBezier = overrides.disableBezier === true || overrides.disableHermite === true;
+  if (disableBezier) {
+    try {
+      await handle.setBezierUploadsEnabled(false);
+    } catch (err) {
+      console.warn('[WebRTX] Failed to disable Bezier uploads on fallback renderer.', err);
+    }
+  }
+  if (disableBezier || overrides.keepBezier !== true) {
+    try {
+      await handle.setBezierPatches([]);
+    } catch (err) {
+      console.warn('[WebRTX] Failed to clear default Bezier patches on fallback renderer.', err);
     }
   }
   return handle;
@@ -383,6 +412,7 @@ async function runMinimalSceneImpl(
   planeHalfHeight = 10.0,
   baseSceneState?: MinimalSceneConfig,
 ){
+  const __ovr = (globalThis as any).__webrtxOverrides || {};
   const fallbackSceneState = baseSceneState ?? buildMinimalSceneState({
     sphereCenter,
     sphereRadius,
@@ -421,8 +451,11 @@ async function runMinimalSceneImpl(
     planeHalfHeight,
     bezierPatches: DEFAULT_BEZIER_PATCHES,
   });
+  const disableBezier = __ovr.disableBezier === true || __ovr.disableHermite === true;
+  if (disableBezier) {
+    fallbackSceneState.bezierPatches = [];
+  }
   // Allow interactive options to override line as startPoint/endPoint with default thickness
-  const __ovr = (globalThis as any).__webrtxOverrides || {};
   const lp0: [number,number,number] = (__ovr.startPoint ?? lineP0) as [number,number,number];
   const lp1: [number,number,number] = (__ovr.endPoint ?? lineP1) as [number,number,number];
   const lrad: number = LINE_RADIUS;
@@ -913,22 +946,15 @@ async function runMinimalSceneImpl(
   }
   writeBezierArrayFromCurr();
   // Shader sources (moved to dedicated module)
-  const rgen = getRayGenShader();
-  const rmiss = getMissShader();
-  const rint = getIntersectionShader();
-  const rchit = getClosestHitShader();
-  const stages: GPURayTracingShaderStageDescriptor[] = [
-    { stage: (globalThis as any).GPUShaderStageRTX?.RAY_GENERATION, glslCode: rgen, entryPoint: 'main' },
-    { stage: (globalThis as any).GPUShaderStageRTX?.RAY_MISS, glslCode: rmiss, entryPoint: 'main' },
-    { stage: (globalThis as any).GPUShaderStageRTX?.RAY_INTERSECTION, glslCode: rint, entryPoint: 'main' },
-    { stage: (globalThis as any).GPUShaderStageRTX?.RAY_CLOSEST_HIT, glslCode: rchit, entryPoint: 'main' },
-  ];
+  function hasBezierPatches(): boolean {
+    return (curr.bezierPatches?.length ?? 0) > 0;
+  }
   const groups: GPURayTracingShaderGroupDescriptor[] = [
     { type: 'general', generalIndex: 0 },
     { type: 'general', generalIndex: 1 },
     { type: 'procedural-hit-group', intersectionIndex: 2, closestHitIndex: 3 },
   ];
-  let pipeline: any = await (device as any).createRayTracingPipeline({ stages, groups }, tlas);
+  let pipeline: any;
   const handleSize = (device as any).ShaderGroupHandleSize as number;
   const baseAlign = (device as any).ShaderGroupBaseAlignment as number;
   const handleAlign = (device as any).ShaderGroupHandleAlignment as number;
@@ -936,7 +962,28 @@ async function runMinimalSceneImpl(
   let sbtBuffer: GPUBuffer;
   let sbt: GPUShaderBindingTable;
   async function recreatePipeline(){
-    // Recreate pipeline bound to current TLAS and rebuild SBT
+    // Recreate pipeline with shader set chosen by current Bezier usage
+    const useBezier = hasBezierPatches();
+    const stageSources = useBezier
+      ? {
+        rgen: getRayGenShader(),
+        rmiss: getMissShader(),
+        rint: getIntersectionShader(),
+        rchit: getClosestHitShader(),
+      }
+      : {
+        rgen: getRayGenShaderNoBezier(),
+        rmiss: getMissShaderNoBezier(),
+        rint: getIntersectionShaderNoBezier(),
+        rchit: getClosestHitShaderNoBezier(),
+      };
+  console.info('[WebRTX] Ray tracing pipeline rebuild – active shader set:', useBezier ? 'hermite' : 'no-bezier');
+  const stages: GPURayTracingShaderStageDescriptor[] = [
+      { stage: (globalThis as any).GPUShaderStageRTX?.RAY_GENERATION, glslCode: stageSources.rgen, entryPoint: 'main' },
+      { stage: (globalThis as any).GPUShaderStageRTX?.RAY_MISS, glslCode: stageSources.rmiss, entryPoint: 'main' },
+      { stage: (globalThis as any).GPUShaderStageRTX?.RAY_INTERSECTION, glslCode: stageSources.rint, entryPoint: 'main' },
+      { stage: (globalThis as any).GPUShaderStageRTX?.RAY_CLOSEST_HIT, glslCode: stageSources.rchit, entryPoint: 'main' },
+    ];
     pipeline = await (device as any).createRayTracingPipeline({ stages, groups }, tlas);
     const handles = pipeline.getShaderGroupHandles(0, groups.length);
     const sbtRayGenStart = 0; const sbtRayMissStart = align(sbtRayGenStart + baseAlign, baseAlign); const sbtHitStart = align(sbtRayMissStart + handleAlign, baseAlign); const sbtTotal = sbtHitStart + handleAlign;
@@ -969,18 +1016,21 @@ async function runMinimalSceneImpl(
     }
   }
   function createUserBG(){
-    const bg = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries:[
-      {binding:0, resource:{ buffer: colorBuffer }},
-      {binding:1, resource:{ buffer: cameraBuf }},
-      {binding:2, resource:{ buffer: sceneMetaBuf }},
-      {binding:9, resource:{ buffer: packedOffsetsBuf }},
-      {binding:4, resource:{ buffer: cylBuf }},
-      {binding:13, resource:{ buffer: packedBuf }},
-      {binding:10, resource:{ buffer: torusArrayBuf }},
-      {binding:11, resource:{ buffer: sphereArrayBuf }},
-      {binding:12, resource:{ buffer: cylArrayBuf }},
-      {binding:14, resource:{ buffer: bezierArrayBuf }},
-    ] }) as any;
+  const list = [
+      { binding: 0, resource: { buffer: colorBuffer } },
+      { binding: 1, resource: { buffer: cameraBuf } },
+      { binding: 2, resource: { buffer: sceneMetaBuf } },
+      { binding: 9, resource: { buffer: packedOffsetsBuf } },
+      { binding: 4, resource: { buffer: cylBuf } },
+      { binding: 13, resource: { buffer: packedBuf } },
+      { binding: 10, resource: { buffer: torusArrayBuf } },
+      { binding: 11, resource: { buffer: sphereArrayBuf } },
+      { binding: 12, resource: { buffer: cylArrayBuf } },
+    ];
+    if (hasBezierPatches()) {
+      list.push({ binding: 14, resource: { buffer: bezierArrayBuf } });
+    }
+    const bg = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: list }) as any;
     // Attach acceleration structure metadata for the polyfill pass encoder
     bg.__accel_container = tlas;
     return bg;
@@ -991,6 +1041,13 @@ async function runMinimalSceneImpl(
     const sphereOverrides = computeOverrideSphereInstances();
     if (sphereOverrides && sphereOverrides.length > 0) {
       await setSpheres(sphereOverrides);
+      if (disableBezier || (__ovr.keepBezier !== true)) {
+        try {
+          await setBezierPatches([]);
+        } catch (err) {
+          console.warn('[WebRTX] Failed to clear default Bezier patches for overrides.', err);
+        }
+      }
     }
   }
   // Rebuild TLAS when primitives move/resize so BVH AABBs match uniforms
